@@ -1,0 +1,143 @@
+# Force Plate Analysis System 🏃‍♂️
+
+A comprehensive Streamlit application for analysing force plate jump data, tracking athlete performance, and identifying performance patterns through advanced analytics.
+
+## 🚀 Live Demo
+[View App on Streamlit Cloud](#) *(Add your deployed URL here)*
+
+## 📋 Features
+
+### 1. **Data Upload & Processing**
+- Simple CSV file upload interface
+- Automatic data cleaning and preprocessing
+- Support for multiple jump types (CMJ, SJ, DJ, etc.)
+- Handles large datasets with multiple athletes and time periods
+
+### 2. **Metrics Analysis**
+- Automatically categorises metrics into 6 performance categories:
+  - Power metrics
+  - Force metrics
+  - Velocity metrics
+  - Jump/Height metrics
+  - Timing metrics
+  - RFD (Rate of Force Development) metrics
+- Quality assessment of each metric
+- Customizable metric selection (10-50 metrics)
+
+### 3. **PCA & Clustering Analysis**
+- Principal Component Analysis for dimensionality reduction
+- Interactive K-means clustering (2-8 clusters)
+- Athlete similarity mapping
+- Feature importance visualization
+- Group identification based on performance patterns
+
+### 4. **Performance Trends**
+- Monthly performance tracking
+- Up to 10 metrics displayed simultaneously
+- Interactive charts with athlete selection
+- Improvement percentage calculations
+- Top performers and needs-attention identification
+
+### 5. **Summary & Export**
+- Comprehensive summary statistics
+- CSV export functionality
+- Detailed improvement analysis
+- Performance heatmaps
+
+## 🛠️ Installation
+
+### Prerequisites
+- Python 3.8 or higher
+- pip package manager
+
+### Local Installation
+
+1. **Clone the repository**
+```bash
+git clone https://github.com/yourusername/force-plate-analysis.git
+cd force-plate-analysis
+```
+
+2. **Install required packages**
+```bash
+pip install -r requirements.txt
+```
+
+3. **Run the application**
+```bash
+streamlit run app.py
+```
+
+4. **Open in browser**
+Navigate to `http://localhost:8501`
+
+## 📊 Data Requirements
+
+Your CSV file should contain the following columns:
+- `ATHLETE_NAME`: Athlete identifiers
+- `TARGET_VARIABLE`: Metric names (e.g., JUMP_HEIGHT, PEAK_POWER)
+- `RESULT`: Measurement values
+- `TEST_DATE`: Date of testing
+- `LIMB`: Should include 'Trial' for bilateral measurements
+- `TEST_TYPE` or `JUMP_TYPE`: Type of jump performed (optional)
+
+### Sample Data Format
+```csv
+ATHLETE_NAME,TARGET_VARIABLE,RESULT,TEST_DATE,LIMB,TEST_TYPE
+John Doe,JUMP_HEIGHT,45.2,2023-01-15,Trial,CMJ
+John Doe,PEAK_POWER,3500,2023-01-15,Trial,CMJ
+...
+```
+
+## 🎯 How to Use
+
+### Step 1: Upload Data
+1. Click on "Choose your force plate CSV file" in the sidebar
+2. Wait for the file to upload and process
+3. Review the data overview statistics
+
+### Step 2: Configure Analysis
+1. **Select Jump Type**: Choose which jump type to analyze
+2. **Select Athletes**: Pick 2-15 athletes for comparison
+3. **Adjust Metrics**: Set number of metrics (10-50)
+4. **Set Clusters**: Choose clustering groups (2-8)
+
+### Step 3: Explore Results
+Navigate through the four analysis tabs:
+
+#### 📈 Metrics Analysis Tab
+- View metric distribution by category
+- See data quality metrics
+- Review selected metrics for analysis
+
+#### 🎯 PCA & Clustering Tab
+- Explore athlete similarity in PCA space
+- Adjust number of clusters with slider
+- View feature importance
+- See cluster assignments
+
+#### 📊 Performance Trends Tab
+- Select specific metrics to track
+- Use quick select buttons for common metrics
+- View monthly performance trends
+- Analyze improvement percentages
+- Interactive legend to show/hide athletes
+
+#### 📋 Summary Report Tab
+- Overview statistics
+- Export results to CSV
+- Key insights and recommendations
+
+## 🔧 Advanced Configuration
+
+### Customizing Metrics Categories
+Edit the categorization logic in `analyze_metrics()` function to add custom categories.
+
+### Adjusting Visualization Settings
+Modify chart heights, colors, and layouts in the respective visualization functions.
+
+## 📧 Support
+
+For issues, questions, or suggestions, please open an issue on GitHub or contact [your-email@example.com]
+
+**Author**: [Your Name]
