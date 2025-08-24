@@ -1,21 +1,17 @@
-# Force Plate Analysis App Requirements
-# Python 3.8+
 
-# Core dependencies
-streamlit==1.28.1
-pandas==2.1.3
-numpy==1.24.3
 
-# Visualization
-plotly==5.18.0
-matplotlib==3.8.0
-seaborn==0.13.0
 
-# Machine Learning
-scikit-learn==1.3.2
+streamlit
+pandas
+numpy
 
-# Data processing
-python-dateutil==2.8.2
 
-# Optional but recommended
-openpyxl==3.1.2  # For Excel file reading if needed
+matplotlib
+plotly
+seaborn
+
+
+scikit-learn
+
+
+python-dateutil
