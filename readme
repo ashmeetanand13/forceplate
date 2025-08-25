@@ -44,50 +44,6 @@ A comprehensive Streamlit application for analysing force plate jump data, track
 - Detailed improvement analysis
 - Performance heatmaps
 
-## 🛠️ Installation
-
-### Prerequisites
-- Python 3.8 or higher
-- pip package manager
-
-### Local Installation
-
-1. **Clone the repository**
-```bash
-git clone https://github.com/yourusername/force-plate-analysis.git
-cd force-plate-analysis
-```
-
-2. **Install required packages**
-```bash
-pip install -r requirements.txt
-```
-
-3. **Run the application**
-```bash
-streamlit run app.py
-```
-
-4. **Open in browser**
-Navigate to `http://localhost:8501`
-
-## 📊 Data Requirements
-
-Your CSV file should contain the following columns:
-- `ATHLETE_NAME`: Athlete identifiers
-- `TARGET_VARIABLE`: Metric names (e.g., JUMP_HEIGHT, PEAK_POWER)
-- `RESULT`: Measurement values
-- `TEST_DATE`: Date of testing
-- `LIMB`: Should include 'Trial' for bilateral measurements
-- `TEST_TYPE` or `JUMP_TYPE`: Type of jump performed (optional)
-
-### Sample Data Format
-```csv
-ATHLETE_NAME,TARGET_VARIABLE,RESULT,TEST_DATE,LIMB,TEST_TYPE
-John Doe,JUMP_HEIGHT,45.2,2023-01-15,Trial,CMJ
-John Doe,PEAK_POWER,3500,2023-01-15,Trial,CMJ
-...
-```
 
 ## 🎯 How to Use
 
@@ -136,8 +92,3 @@ Edit the categorization logic in `analyze_metrics()` function to add custom cate
 ### Adjusting Visualization Settings
 Modify chart heights, colors, and layouts in the respective visualization functions.
 
-## 📧 Support
-
-For issues, questions, or suggestions, please open an issue on GitHub or contact [your-email@example.com]
-
-**Author**: [Your Name]
