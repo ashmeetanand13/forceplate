@@ -471,7 +471,7 @@ def analyze_trends(df, selected_athletes, selected_metrics):
 # ==========================================
 
 def main():
-    st.title("🏃‍♂️ Force Plate Jump Analysis System")
+    st.title("🏃‍♂️ Force Plate - Analysis System")
     st.markdown("### Analyze force plate data to track athlete performance and identify patterns")
     
     # Sidebar for file upload and settings
