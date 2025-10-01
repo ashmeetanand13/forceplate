@@ -2,6 +2,7 @@
 Force Plate Analysis Streamlit Application
 ==========================================
 A comprehensive, robust interface for analyzing force plate jump data
+Handles both wide and long format CSV files
 """
 
 import streamlit as st
@@ -42,132 +43,366 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ==========================================
-# HELPER FUNCTIONS
+# DATA LOADING AND FORMAT HANDLING FUNCTIONS
 # ==========================================
+
+def detect_csv_format(df):
+    """
+    Detect whether the CSV is in wide or long format
+    
+    Returns:
+        str: 'wide' or 'long' format type
+    """
+    # Check for long format indicators
+    long_format_columns = {'TARGET_VARIABLE', 'RESULT', 'ATHLETE_NAME', 'TEST_DATE'}
+    long_format_match = len(long_format_columns & set(df.columns))
+    
+    # Quick return if strong long format match
+    if long_format_match >= 3:
+        return 'long'
+    
+    # Check for wide format indicators
+    # Wide format typically has many columns with units in brackets
+    columns_with_brackets = sum(1 for col in df.columns if '[' in col and ']' in col)
+    
+    # Wide format decision
+    if columns_with_brackets > 5 or 'Name' in df.columns:
+        return 'wide'
+    
+    # Fallback: check numeric columns ratio
+    # Wide format usually has many numeric columns with fewer rows
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    if len(numeric_columns) > 10 and len(df) < 1000:
+        return 'wide'
+    
+    return 'long'
+
+def standardize_column_names(df, format_type):
+    """
+    Standardize column names based on format type
+    """
+    if format_type == 'wide':
+        # Rename common columns for wide format
+        column_mapping = {
+            'Name': 'ATHLETE_NAME',
+            'ExternalId': 'ATHLETE_ID',
+            'Test Type': 'TEST_TYPE',
+            'Date': 'TEST_DATE',
+            'Time': 'TEST_TIME',
+            'BW [KG]': 'BODY_WEIGHT_KG',
+            'Additional Load [kg]': 'ADDITIONAL_LOAD_KG'
+        }
+        # Only rename columns that actually exist to avoid unnecessary operations
+        existing_mappings = {k: v for k, v in column_mapping.items() if k in df.columns}
+        if existing_mappings:
+            return df.rename(columns=existing_mappings)
+    
+    return df
+
+def extract_metric_name_and_unit(column_name):
+    """
+    Extract clean metric name and unit from column name
+    Example: 'Jump Height (Imp-Mom) [cm]' -> ('Jump Height (Imp-Mom)', 'cm')
+    """
+    # Find the last occurrence of [ and ]
+    start_bracket = column_name.rfind('[')
+    end_bracket = column_name.rfind(']')
+    
+    # Check if valid brackets exist and are in correct order
+    if start_bracket > 0 and start_bracket < end_bracket:
+        unit = column_name[start_bracket + 1:end_bracket]
+        metric_name = column_name[:start_bracket].rstrip()  # Use rstrip() instead of strip()
+        return metric_name, unit
+    
+    # No valid unit found
+    return column_name, ''
+
+def convert_wide_to_long(df_wide):
+    """
+    Convert wide format dataframe to long format
+    """
+    # Standardize column names first
+    df_wide = standardize_column_names(df_wide, 'wide')
+    
+    # Common ID columns in wide format
+    potential_id_cols = {'ATHLETE_NAME', 'ATHLETE_ID', 'TEST_TYPE', 'TEST_DATE', 
+                        'TEST_TIME', 'BODY_WEIGHT_KG', 'ADDITIONAL_LOAD_KG',
+                        'Reps', 'Tags'}
+    
+    # Keywords that indicate metric columns (converted to set for O(1) lookup)
+    metric_keywords = {'force', 'power', 'velocity', 'time', 'height', 'impulse', 
+                      'rfd', 'depth', 'duration', 'peak', 'mean', 'concentric', 
+                      'eccentric', 'jump', 'rsi', 'takeoff', 'landing', 'contraction',
+                      'flight', 'braking', 'countermovement'}
+    
+    # Separate ID and metric columns
+    id_columns = list(potential_id_cols & set(df_wide.columns))
+    metric_columns = []
+    
+    for col in df_wide.columns:
+        if col in id_columns:
+            continue
+            
+        # Check if it's likely a metric column
+        if '[' in col or '/' in col or '%' in col:
+            metric_columns.append(col)
+        else:
+            col_lower = col.lower()
+            # Use any() with generator for early termination
+            if any(keyword in col_lower for keyword in metric_keywords):
+                metric_columns.append(col)
+    
+    # If no ID columns identified, use index
+    if not id_columns:
+        df_wide = df_wide.assign(ROW_ID=df_wide.index)
+        id_columns = ['ROW_ID']
+    
+    # Ensure we have ATHLETE_NAME
+    if 'ATHLETE_NAME' not in id_columns:
+        df_wide = df_wide.assign(ATHLETE_NAME=[f"Athlete_{i}" for i in range(len(df_wide))])
+        id_columns.append('ATHLETE_NAME')
+    
+    # Melt the dataframe to long format
+    df_long = pd.melt(
+        df_wide,
+        id_vars=id_columns,
+        value_vars=metric_columns,
+        var_name='METRIC_FULL',
+        value_name='RESULT'
+    )
+    
+    # Extract metric name and unit more efficiently
+    df_long[['TARGET_VARIABLE', 'UNITS']] = pd.DataFrame(
+        [extract_metric_name_and_unit(x) for x in df_long['METRIC_FULL']], 
+        index=df_long.index
+    )
+    
+    # Drop the temporary column
+    df_long = df_long.drop('METRIC_FULL', axis=1)
+    
+    # Add missing columns with vectorized operations
+    df_long = df_long.assign(
+        TEST_ID=range(len(df_long)),
+        LIMB='Trial',
+        TRIAL_LIMB='Bilateral',
+        RESULT_TYPE='Measured',
+        DESCRIPTION=df_long['TARGET_VARIABLE']
+    )
+    
+    # Ensure TEST_DATE is in datetime format
+    if 'TEST_DATE' in df_long.columns:
+        df_long['TEST_DATE'] = pd.to_datetime(df_long['TEST_DATE'], errors='coerce')
+    
+    # Convert RESULT to numeric and drop NaN in one operation
+    df_long['RESULT'] = pd.to_numeric(df_long['RESULT'], errors='coerce')
+    df_long = df_long.dropna(subset=['RESULT'])
+    
+    return df_long
+
+def clean_metric_names(df):
+    """
+    Standardize metric names for consistency
+    """
+    if 'TARGET_VARIABLE' not in df.columns:
+        return df
+    
+    # Strip spaces first (do once)
+    df['TARGET_VARIABLE'] = df['TARGET_VARIABLE'].str.strip()
+    
+    # Combine all replacements into a single operation
+    replacements = {
+        'Peak Power / BM': 'Peak Power Per BM',
+        'Flight Time:Contraction Time': 'Flight Time To Contraction Time Ratio',
+        'RSI-modified': 'RSI Modified',
+        '% (Asym)': 'Asymmetry',
+        'Imp-Mom': 'Impulse Momentum',
+        'RFD': 'Rate of Force Development'
+    }
+    
+    # Use regex=False and single replace call with dictionary
+    df['TARGET_VARIABLE'] = df['TARGET_VARIABLE'].replace(replacements, regex=False)
+    
+    return df
 
 @st.cache_data
 def load_and_clean_data(uploaded_file):
-    """Load and clean the force plate data"""
+    """
+    Robust data loader that handles both wide and long format CSVs
+    """
     try:
-        df = pd.read_csv(uploaded_file, low_memory=False)
+        # Read the CSV
+        df_raw = pd.read_csv(uploaded_file, low_memory=False)
         
-        # Filter for Trial limb only (bilateral measurements)
-        df_clean = df[df['LIMB'] == 'Trial'].copy()
+        # Detect format
+        format_type = detect_csv_format(df_raw)
+        st.sidebar.info(f"📊 Detected format: **{format_type.upper()}** format")
         
-        # Convert dates and add temporal columns
-        df_clean['TEST_DATE'] = pd.to_datetime(df_clean['TEST_DATE'])
-        df_clean['YEAR'] = df_clean['TEST_DATE'].dt.year
-        df_clean['QUARTER'] = df_clean['TEST_DATE'].dt.quarter
-        df_clean['MONTH'] = df_clean['TEST_DATE'].dt.month
+        # Convert to long format if needed (work in place when possible)
+        if format_type == 'wide':
+            df = convert_wide_to_long(df_raw)
+            st.sidebar.success("✅ Converted to long format")
+        else:
+            df = df_raw  # No copy needed here
         
-        # Convert RESULT to numeric
-        df_clean['RESULT'] = pd.to_numeric(df_clean['RESULT'], errors='coerce')
+        # Clean metric names in place
+        df = clean_metric_names(df)
         
-        # Remove infinite values
-        df_clean = df_clean.replace([np.inf, -np.inf], np.nan)
+        # Check required columns once
+        required_columns = {'ATHLETE_NAME', 'TARGET_VARIABLE', 'RESULT', 'TEST_DATE', 'LIMB'}
+        existing_columns = set(df.columns)
+        missing_columns = required_columns - existing_columns
         
-        return df_clean
+        if missing_columns:
+            st.sidebar.warning(f"⚠️ Missing columns: {list(missing_columns)}")
+            # Add missing LIMB column if needed
+            if 'LIMB' not in existing_columns:
+                df['LIMB'] = 'Trial'
+        
+        # Filter for Trial limb only (bilateral measurements) - avoid copy if already filtered
+        if 'LIMB' in df.columns and not df['LIMB'].eq('Trial').all():
+            df = df[df['LIMB'] == 'Trial']
+        
+        # Convert dates and add temporal columns in one operation
+        if 'TEST_DATE' in df.columns:
+            df['TEST_DATE'] = pd.to_datetime(df['TEST_DATE'], errors='coerce')
+            # Add all temporal columns at once
+            df = df.assign(
+                YEAR=df['TEST_DATE'].dt.year,
+                QUARTER=df['TEST_DATE'].dt.quarter,
+                MONTH=df['TEST_DATE'].dt.month
+            )
+        else:
+            # Create dummy date and temporal columns at once
+            current_time = pd.Timestamp.now()
+            df = df.assign(
+                TEST_DATE=current_time,
+                YEAR=current_time.year,
+                QUARTER=1,
+                MONTH=1
+            )
+        
+        # Convert RESULT to numeric (already done in convert_wide_to_long for wide format)
+        if format_type != 'wide':
+            df['RESULT'] = pd.to_numeric(df['RESULT'], errors='coerce')
+        
+        # Replace infinite values with NaN in one operation
+        df = df.replace([np.inf, -np.inf], np.nan)
+        
+        # Show conversion summary
+        if format_type == 'wide':
+            st.sidebar.markdown("**📋 Conversion Summary:**")
+            col1, col2 = st.sidebar.columns(2)
+            with col1:
+                st.metric("Original Columns", len(df_raw.columns))
+                st.metric("Metrics Extracted", df['TARGET_VARIABLE'].nunique())
+            with col2:
+                st.metric("Athletes", df['ATHLETE_NAME'].nunique())
+                st.metric("Data Points", len(df))
+        
+        return df
+        
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
+        st.error("Please check your CSV format")
         return None
+# ==========================================
+# ANALYSIS HELPER FUNCTIONS
+# ==========================================
 
 def get_jump_types(df):
     """Extract unique jump types from the data"""
+    # Check for explicit jump type columns first
     if 'TEST_TYPE' in df.columns:
         return sorted(df['TEST_TYPE'].dropna().unique())
     elif 'JUMP_TYPE' in df.columns:
         return sorted(df['JUMP_TYPE'].dropna().unique())
-    else:
-        # Try to infer from TARGET_VARIABLE
-        jump_indicators = ['CMJ', 'SJ', 'DJ', 'JUMP']
-        jump_types = set()
-        for var in df['TARGET_VARIABLE'].unique():
+    
+    # Try to infer from TARGET_VARIABLE
+    jump_indicators = {'CMJ', 'SJ', 'DJ', 'JUMP'}
+    jump_types = set()
+    
+    # Use vectorized string operations for efficiency
+    if 'TARGET_VARIABLE' in df.columns:
+        target_vars = df['TARGET_VARIABLE'].dropna().unique()
+        for var in target_vars:
+            var_upper = var.upper()
             for indicator in jump_indicators:
-                if indicator in var:
+                if indicator in var_upper:
                     jump_types.add(indicator)
-        return sorted(list(jump_types)) if jump_types else ['All Jumps']
+                    break  # No need to check other indicators for this variable
+    
+    return sorted(jump_types) if jump_types else ['All Jumps']
 
 def filter_data_by_jump(df, jump_type):
     """Filter data for specific jump type"""
     if jump_type == 'All Jumps':
         return df
     
-    # Try different column names
+    # Try different column names - return first match found
     if 'TEST_TYPE' in df.columns:
         return df[df['TEST_TYPE'] == jump_type]
-    elif 'JUMP_TYPE' in df.columns:
+    
+    if 'JUMP_TYPE' in df.columns:
         return df[df['JUMP_TYPE'] == jump_type]
-    else:
-        # Filter by TARGET_VARIABLE containing jump type
-        return df[df['TARGET_VARIABLE'].str.contains(jump_type, na=False)]
+    
+    # Filter by TARGET_VARIABLE containing jump type
+    # Use case=False for case-insensitive matching
+    if 'TARGET_VARIABLE' in df.columns:
+        return df[df['TARGET_VARIABLE'].str.contains(jump_type, na=False, case=False)]
+    
+    # No filtering possible - return original
+    return df
 
-def analyze_metrics(df, num_metrics=30):
-    """Analyze and categorize available metrics"""
+def analyze_metrics(df):
+    """Analyze and categorize available metrics - returns ALL metrics with stats"""
     all_metrics = df['TARGET_VARIABLE'].unique()
     
-    # Analyze each metric's quality
-    metric_analysis = []
-    for metric in all_metrics:
-        metric_data = df[df['TARGET_VARIABLE'] == metric]
-        
-        if len(metric_data) > 0:
-            values = pd.to_numeric(metric_data['RESULT'], errors='coerce').dropna()
-            
-            if len(values) > 0:
-                metric_analysis.append({
-                    'metric': metric,
-                    'completeness_pct': len(values) / len(metric_data) * 100,
-                    'num_athletes': metric_data['ATHLETE_NAME'].nunique(),
-                    'num_datapoints': len(values),
-                    'mean': values.mean(),
-                    'std': values.std(),
-                    'cv': values.std() / values.mean() if values.mean() != 0 else 0
-                })
+    # Group by metric once
+    grouped = df.groupby('TARGET_VARIABLE', observed=True)
     
-    metrics_df = pd.DataFrame(metric_analysis).sort_values('completeness_pct', ascending=False)
+    # Use aggregation instead of looping
+    agg_results = grouped.agg({
+        'RESULT': ['count', 
+                   lambda x: pd.to_numeric(x, errors='coerce').dropna().mean(),
+                   lambda x: pd.to_numeric(x, errors='coerce').dropna().std(),
+                   lambda x: len(pd.to_numeric(x, errors='coerce').dropna())],
+        'ATHLETE_NAME': 'nunique'
+    })
     
-    # Categorize metrics
-    power_metrics = [m for m in all_metrics if 'POWER' in m.upper()]
-    force_metrics = [m for m in all_metrics if 'FORCE' in m.upper() and 'RFD' not in m.upper()]
-    velocity_metrics = [m for m in all_metrics if 'VELOCITY' in m.upper()]
-    jump_metrics = [m for m in all_metrics if any(x in m.upper() for x in ['JUMP', 'HEIGHT', 'RSI'])]
-    timing_metrics = [m for m in all_metrics if any(x in m.upper() for x in ['TIME', 'DURATION'])]
-    rfd_metrics = [m for m in all_metrics if 'RFD' in m.upper()]
+    # Flatten multi-level columns
+    agg_results.columns = ['total_count', 'mean', 'std', 'valid_count', 'num_athletes']
+    agg_results = agg_results.reset_index()
+    agg_results.columns = ['metric', 'total_count', 'mean', 'std', 'num_datapoints', 'num_athletes']
     
-    # Select high-quality metrics
-    high_quality = metrics_df[
-        (metrics_df['completeness_pct'] >= 70) & 
-        (metrics_df['num_athletes'] >= 3) &
-        (metrics_df['cv'] >= 0.05) &
-        (metrics_df['cv'] <= 2.0)
-    ]
+    # Calculate derived metrics
+    agg_results['completeness_pct'] = (agg_results['num_datapoints'] / agg_results['total_count']) * 100
+    agg_results['cv'] = agg_results['std'] / agg_results['mean'].replace(0, np.nan)
+    agg_results['cv'] = agg_results['cv'].fillna(0)
     
-    # Prioritize key metrics
-    priority_keywords = ['JUMP_HEIGHT', 'PEAK_TAKEOFF_FORCE', 'PEAK_POWER', 'RSI', 
-                        'CONCENTRIC', 'ECCENTRIC', 'FLIGHT_TIME', 'CONTRACTION_TIME', 
-                        'TAKEOFF_VELOCITY', 'LANDING_FORCE']
+    # Drop total_count
+    metrics_df = agg_results.drop('total_count', axis=1).sort_values('completeness_pct', ascending=False)
     
-    selected_metrics = []
-    for keyword in priority_keywords:
-        matching = [m for m in high_quality['metric'] if keyword in m.upper()]
-        selected_metrics.extend(matching[:2])
+    # Categorize metrics using vectorized string operations
+    metric_upper = metrics_df['metric'].str.upper()
     
-    # Remove duplicates
-    selected_metrics = list(dict.fromkeys(selected_metrics))
-    
-    # Add more if needed
-    if len(selected_metrics) < 10:
-        additional = high_quality[~high_quality['metric'].isin(selected_metrics)]['metric'].head(10 - len(selected_metrics)).tolist()
-        selected_metrics.extend(additional)
-    
-    return metrics_df, selected_metrics[:num_metrics], {
-        'power': power_metrics,
-        'force': force_metrics,
-        'velocity': velocity_metrics,
-        'jump': jump_metrics,
-        'timing': timing_metrics,
-        'rfd': rfd_metrics
+    # Create category dictionary
+    categories = {
+        'power': metrics_df.loc[metric_upper.str.contains('POWER', na=False), 'metric'].tolist(),
+        'force': metrics_df.loc[metric_upper.str.contains('FORCE', na=False) & 
+                                ~metric_upper.str.contains('RFD', na=False), 'metric'].tolist(),
+        'velocity': metrics_df.loc[metric_upper.str.contains('VELOCITY', na=False), 'metric'].tolist(),
+        'jump': metrics_df.loc[metric_upper.str.contains('JUMP|HEIGHT|RSI', regex=True, na=False), 'metric'].tolist(),
+        'timing': metrics_df.loc[metric_upper.str.contains('TIME|DURATION', regex=True, na=False), 'metric'].tolist(),
+        'rfd': metrics_df.loc[metric_upper.str.contains('RFD', na=False), 'metric'].tolist()
     }
+    
+    # Get ALL available metrics (filter out low quality ones)
+    all_available_metrics = metrics_df[
+        (metrics_df['completeness_pct'] >= 50) &  # Lowered from 70 to include more
+        (metrics_df['num_athletes'] >= 2)  # At least 2 athletes
+    ]['metric'].tolist()
+    
+    return metrics_df, all_available_metrics, categories
 
 def perform_pca_analysis(df, selected_metrics, selected_athletes):
     """Perform PCA analysis on selected data"""
@@ -226,7 +461,7 @@ def create_visualizations(pca_results, num_clusters=3):
     athlete_names = list(pca_results['athlete_metrics'].index)
     colors = px.colors.qualitative.Set1
     
-    # 1. PCA Space - Make it bigger
+    # 1. PCA Space
     for i, athlete in enumerate(athlete_names):
         fig.add_trace(
             go.Scatter(
@@ -309,7 +544,7 @@ def create_visualizations(pca_results, num_clusters=3):
         row=4, col=1
     )
     
-    # Update layout for better spacing
+    # Update layout
     fig.update_layout(
         height=2500,
         title_text="<b>Force Plate Analysis - PCA & Clustering Dashboard</b>",
@@ -318,7 +553,7 @@ def create_visualizations(pca_results, num_clusters=3):
         font=dict(size=12)
     )
     
-    # Update axes labels with better formatting
+    # Update axes labels
     fig.update_xaxes(title_text="<b>Principal Component 1</b>", row=1, col=1, title_font_size=14)
     fig.update_yaxes(title_text="<b>Principal Component 2</b>", row=1, col=1, title_font_size=14)
     
@@ -637,17 +872,33 @@ def main():
                     default=top_athletes[:20],
                     help="Choose athletes for comparison (recommended: 5-15 athletes)"
                 )
-                
-                # Add metric count selector
+
+                # Date range filter
                 st.markdown("---")
-                num_metrics_to_analyze = st.slider(
-                    "Number of Metrics to Analyze",
-                    min_value=10,
-                    max_value=50,
-                    value=30,
-                    step=5,
-                    help="Select how many metrics to include in analysis"
+                st.subheader("📅 Date Range Filter")
+
+                min_date = df_jump['TEST_DATE'].min().date()
+                max_date = df_jump['TEST_DATE'].max().date()
+
+                date_range = st.date_input(
+                    "Select Date Range",
+                    value=(min_date, max_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                    help="Filter data by test date range"
                 )
+
+                # Apply date filter to df_jump
+                if len(date_range) == 2:
+                    start_date, end_date = date_range
+                    df_jump = df_jump[
+                        (df_jump['TEST_DATE'].dt.date >= start_date) & 
+                        (df_jump['TEST_DATE'].dt.date <= end_date)
+                    ]
+                    st.success(f"📊 Filtered to {len(df_jump):,} records between {start_date} and {end_date}")
+                elif len(date_range) == 1:
+                    st.warning("Please select both start and end dates")
+
                 
                 if len(selected_athletes) < 2:
                     st.warning("⚠️ Please select at least 2 athletes for analysis")
@@ -662,7 +913,7 @@ def main():
             st.header("Metrics Analysis")
             
             with st.spinner("Analyzing metrics..."):
-                metrics_df, selected_metrics, metric_categories = analyze_metrics(df_jump, num_metrics_to_analyze)
+                metrics_df, all_available_metrics, metric_categories = analyze_metrics(df_jump)
             
             col1, col2 = st.columns(2)
             
@@ -691,65 +942,65 @@ def main():
                 top_metrics['Completeness %'] = top_metrics['Completeness %'].round(1)
                 st.dataframe(top_metrics, hide_index=True)
             
-            st.subheader("📝 Selected Metrics for Analysis")
-            selected_display = pd.DataFrame({
-                'Selected Metrics': selected_metrics,
-                'Category': [
-                    'Power' if 'POWER' in m.upper() else
-                    'Force' if 'FORCE' in m.upper() else
-                    'Velocity' if 'VELOCITY' in m.upper() else
-                    'Jump' if any(x in m.upper() for x in ['JUMP', 'HEIGHT', 'RSI']) else
-                    'Timing' if any(x in m.upper() for x in ['TIME', 'DURATION']) else
-                    'RFD' if 'RFD' in m.upper() else
-                    'Eccentric' if 'ECCENTRIC' in m.upper() else
-                    'Concentric' if 'CONCENTRIC' in m.upper() else
-                    'Other'
-                    for m in selected_metrics
-                ]
-            })
-            st.dataframe(selected_display, hide_index=True)
+            st.subheader("🔍 Available Metrics for Analysis")
+            st.info(f"Total of {len(all_available_metrics)} metrics available across all categories")
+
+            # Show breakdown by category
+            with st.expander("View metrics by category"):
+                for category, metrics in metric_categories.items():
+                    if metrics:  # Only show non-empty categories
+                        st.markdown(f"**{category.title()}**: {len(metrics)} metrics")
         
         with tab2:
             st.header("PCA Analysis & Clustering")
+           
             
-            if len(selected_metrics) > 0:
+            # ==========================================
+            # SECTION 1: OVERALL PCA WITH ALL METRICS
+            # ==========================================
+            
+            st.subheader("🎯 Overall PCA Analysis - All Available Metrics")
+            st.markdown(f"*Using all {len(all_available_metrics)} available metrics from {selected_jump}*")
+            
+            if len(all_available_metrics) >= 3:
                 # Add cluster selection control
-                col1, col2, col3 = st.columns([1, 1, 2])
+                col1, col2 = st.columns([1, 2])
                 with col1:
-                    num_clusters = st.slider(
-                        "Number of Clusters",
+                    num_clusters_overall = st.slider(
+                        "Number of Clusters (Overall)",
                         min_value=2,
                         max_value=min(8, len(selected_athletes)),
                         value=3,
-                        help="Choose how many groups to create"
+                        help="Choose how many groups to create",
+                        key="overall_clusters"
                     )
                 
-                with st.spinner("Performing PCA analysis..."):
-                    pca_results = perform_pca_analysis(df_jump, selected_metrics, selected_athletes)
-                    fig_pca, clusters = create_visualizations(pca_results, num_clusters)
+                with st.spinner("Performing Overall PCA analysis with all metrics..."):
+                    pca_results_overall = perform_pca_analysis(df_jump, all_available_metrics, selected_athletes)
+                    fig_pca_overall, clusters_overall = create_visualizations(pca_results_overall, num_clusters_overall)
                 
-                st.plotly_chart(fig_pca, use_container_width=True)
+                st.plotly_chart(fig_pca_overall, use_container_width=True)
                 
                 # Show cluster assignments
-                st.subheader("🎯 Cluster Assignments")
-                cluster_df = pd.DataFrame({
-                    'Athlete': list(pca_results['athlete_metrics'].index),
-                    'Cluster': [f"Group {c + 1}" for c in clusters]
+                st.subheader("🎯 Cluster Assignments (Overall Analysis)")
+                cluster_df_overall = pd.DataFrame({
+                    'Athlete': list(pca_results_overall['athlete_metrics'].index),
+                    'Cluster': [f"Group {c + 1}" for c in clusters_overall]
                 })
                 
                 # Create columns for cluster groups
-                cols = st.columns(min(num_clusters, 3))
-                for i in range(num_clusters):
+                cols = st.columns(min(num_clusters_overall, 3))
+                for i in range(num_clusters_overall):
                     with cols[i % 3]:
                         st.markdown(f"**Group {i + 1}**")
-                        group_athletes = cluster_df[cluster_df['Cluster'] == f"Group {i + 1}"]['Athlete'].tolist()
+                        group_athletes = cluster_df_overall[cluster_df_overall['Cluster'] == f"Group {i + 1}"]['Athlete'].tolist()
                         for athlete in group_athletes:
                             st.write(f"• {athlete}")
             else:
-                st.warning("⚠️ No metrics available for PCA analysis")
+                st.warning("⚠️ Not enough metrics available for Overall PCA analysis")
 
             # ==========================================
-            # ENHANCED PCA ANALYSIS WITH METRIC CATEGORIES
+            # SECTION 2: ENHANCED PCA WITH CATEGORY SELECTION
             # ==========================================
             
             st.markdown("---")
@@ -770,7 +1021,6 @@ def main():
             # Force Production
             force_patterns = ["FORCE", "WEIGHT_RELATIVE", "BODYMASS_RELATIVE", "BM_REL"]
             force_metrics = get_metrics_by_pattern(force_patterns, available_metrics_in_data)
-            # Remove RFD metrics from force category
             force_metrics = [m for m in force_metrics if "RFD" not in m.upper() and "RPD" not in m.upper()]
             METRIC_CATEGORIES["Force Production"] = force_metrics
             
@@ -781,7 +1031,6 @@ def main():
             # Speed/Velocity
             velocity_patterns = ["VELOCITY", "ACCELERATION"]
             velocity_metrics = get_metrics_by_pattern(velocity_patterns, available_metrics_in_data)
-            # Remove power-related velocity metrics to avoid duplication
             velocity_metrics = [m for m in velocity_metrics if "POWER" not in m.upper()]
             METRIC_CATEGORIES["Speed/Velocity"] = velocity_metrics
             
@@ -804,7 +1053,6 @@ def main():
             # Ratios & Performance Indices  
             ratio_patterns = ["RATIO", "RELATIVE", "INDEX", "_REL_", "MODIFIED"]
             ratio_metrics = get_metrics_by_pattern(ratio_patterns, available_metrics_in_data)
-            # Remove metrics already categorized elsewhere
             excluded_patterns = ["FORCE", "POWER", "VELOCITY", "IMPULSE"]
             ratio_metrics = [m for m in ratio_metrics if not any(exc in m.upper() for exc in excluded_patterns)]
             METRIC_CATEGORIES["Ratios & Performance Indices"] = ratio_metrics
@@ -825,7 +1073,6 @@ def main():
             # Category selection with checkboxes
             st.markdown("**📋 Select Metric Categories:**")
             
-            # Create dynamic columns based on available categories
             num_categories = len(METRIC_CATEGORIES)
             if num_categories <= 3:
                 cols = st.columns(num_categories)
@@ -853,7 +1100,6 @@ def main():
                 # Remove duplicates while preserving order
                 enhanced_metrics = list(dict.fromkeys(enhanced_metrics))
                 
-                # Validate we have enough metrics
                 if len(enhanced_metrics) >= 3:
                     st.success(f"Selected {len(enhanced_metrics)} metrics from {len(selected_categories)} categories")
                     
@@ -1052,6 +1298,9 @@ def main():
                                                 st.write(f"• {row['Metric'][:25]}: {row['Z_Score']:.1f}σ")
                 else:
                     st.warning("Please select at least 3 metrics for PCA analysis.")
+            
+           
+
             else:
                 st.info("👆 Select at least one metric category to perform enhanced PCA analysis.")
                 st.markdown("""
@@ -1067,70 +1316,63 @@ def main():
                 - **Ratios & Performance Indices**: Calculated performance ratios and efficiency metrics
                 """)
 
+
         with tab3:
             st.header("Performance Trends Over Time")
             
-            if len(selected_metrics) > 0:
-                # Add metric selector for trends
-                st.subheader("Select Metrics to Track")
+            st.subheader("Select Metrics to Track")
+            
+            # Use the metric categories from Tab 1
+            st.markdown("**Choose categories and specific metrics for trend analysis:**")
+            
+            # Category selection - full width (no columns needed)
+            trend_categories = st.multiselect(
+                "Select Categories",
+                options=list(metric_categories.keys()),
+                default=list(metric_categories.keys())[:2] if len(metric_categories) > 0 else [],
+                help="Choose which metric categories to include",
+                key="trend_categories"
+            )
+
+            # Get metrics from selected categories
+            metrics_from_categories = []
+            if trend_categories:
+                for category in trend_categories:
+                    metrics_from_categories.extend(metric_categories[category])
                 
-                # Organize metrics by category for easier selection
-                metrics_by_category = {}
-                for metric in selected_metrics:
-                    if 'POWER' in metric.upper():
-                        cat = 'Power'
-                    elif 'FORCE' in metric.upper():
-                        cat = 'Force'
-                    elif 'VELOCITY' in metric.upper():
-                        cat = 'Velocity'
-                    elif any(x in metric.upper() for x in ['JUMP', 'HEIGHT', 'RSI']):
-                        cat = 'Jump/Height'
-                    elif any(x in metric.upper() for x in ['TIME', 'DURATION']):
-                        cat = 'Timing'
-                    elif 'RFD' in metric.upper():
-                        cat = 'RFD'
-                    elif 'ECCENTRIC' in metric.upper():
-                        cat = 'Eccentric'
-                    elif 'CONCENTRIC' in metric.upper():
-                        cat = 'Concentric'
-                    else:
-                        cat = 'Other'
-                    
-                    if cat not in metrics_by_category:
-                        metrics_by_category[cat] = []
-                    metrics_by_category[cat].append(metric)
-                
-                # Create columns for metric selection
-                col1, col2 = st.columns([3, 1])
-                
-                with col1:
-                    # Multi-select for metrics
-                    metrics_for_trends = st.multiselect(
-                        "Choose metrics to analyze trends",
-                        options=selected_metrics,
-                        default=selected_metrics[:10],
-                        help="Select which metrics you want to see trends for (up to 10 recommended)",
-                        format_func=lambda x: f"{x[:40]}..." if len(x) > 40 else x
-                    )
-                
-                with col2:
-                    # Quick select buttons
-                    st.markdown("**Quick Select:**")
-                    if st.button("Top 10"):
-                        metrics_for_trends = selected_metrics[:10]
-                    if st.button("Power Metrics"):
-                        metrics_for_trends = [m for m in selected_metrics if 'POWER' in m.upper()]
-                    if st.button("Jump Metrics"):
-                        metrics_for_trends = [m for m in selected_metrics if any(x in m.upper() for x in ['JUMP', 'HEIGHT', 'RSI'])]
-                    if st.button("Clear All"):
-                        metrics_for_trends = []
-                
+                # Remove duplicates
+                metrics_from_categories = list(dict.fromkeys(metrics_from_categories))
+
+            # Now let user select specific metrics
+            if metrics_from_categories:
+                # Initialize session state if needed
+                if 'trends_metrics' not in st.session_state:
+                    st.session_state.trends_metrics = metrics_from_categories[:10]
+
+                # Filter session state to only include metrics that exist in current options
+                valid_defaults = [m for m in st.session_state.trends_metrics if m in metrics_from_categories]
+                if not valid_defaults:
+                    valid_defaults = metrics_from_categories[:10]
+
+                metrics_for_trends = st.multiselect(
+                    "Choose specific metrics to analyze",
+                    options=metrics_from_categories,
+                    default=valid_defaults[:10],
+                    help="Select which metrics you want to see trends for (up to 20 recommended)",
+                    format_func=lambda x: f"{x[:50]}..." if len(x) > 50 else x,
+                    key="trend_metrics_selector"
+                )
+                                        
                 # Show category breakdown
-                with st.expander("View metrics by category"):
-                    for cat, metrics in metrics_by_category.items():
-                        st.markdown(f"**{cat}:** {len(metrics)} metrics")
-                        for m in metrics:
-                            st.write(f"  • {m}")
+                with st.expander("View selected metrics by category"):
+                    for cat in trend_categories:
+                        cat_metrics = [m for m in metrics_for_trends if m in metric_categories[cat]]
+                        if cat_metrics:
+                            st.markdown(f"**{cat.title()}**: {len(cat_metrics)} metrics")
+                            for m in cat_metrics[:5]:
+                                st.write(f"  • {m}")
+                            if len(cat_metrics) > 5:
+                                st.write(f"  • ... and {len(cat_metrics) - 5} more")
                 
                 if len(metrics_for_trends) > 0:
                     with st.spinner("Analyzing trends..."):
@@ -1193,7 +1435,7 @@ def main():
                 else:
                     st.warning("⚠️ Please select at least one metric to analyze trends")
             else:
-                st.warning("⚠️ No metrics available for trend analysis")
+                st.info("👆 Please select at least one category to see available metrics")
         
         with tab4:
             st.header("Summary Report")
@@ -1203,7 +1445,7 @@ def main():
             
             with col1:
                 st.metric("Athletes Analyzed", len(selected_athletes))
-                st.metric("Metrics Evaluated", len(selected_metrics))
+                st.metric("Total Metrics Available", len(all_available_metrics))
             
             with col2:
                 st.metric("Jump Type", selected_jump)
@@ -1211,7 +1453,7 @@ def main():
             
             with col3:
                 st.metric("Time Period", f"{df_jump['YEAR'].min()}-{df_jump['YEAR'].max()}")
-                st.metric("Unique Clusters", len(np.unique(clusters)) if 'clusters' in locals() else "N/A")
+                st.metric("Unique Clusters", len(np.unique(clusters_overall)) if 'clusters_overall' in locals() else "N/A")
             
             # Export functionality
             st.markdown("---")
@@ -1250,12 +1492,15 @@ def main():
         
         ### Data Requirements:
         
-        Your CSV should contain:
-        - `ATHLETE_NAME`: Athlete identifiers
-        - `TARGET_VARIABLE`: Metric names
-        - `RESULT`: Measurement values
-        - `TEST_DATE`: Date of testing
-        - `LIMB`: Should include 'Trial' for bilateral measurements
+        Your CSV can be in either format:
+        
+        **Format 1 (Wide):** Each row = one test, metrics as columns
+        - Columns like: `Name`, `Jump Height [cm]`, `Peak Power [W]`, etc.
+        
+        **Format 2 (Long):** Each row = one measurement
+        - Columns: `ATHLETE_NAME`, `TARGET_VARIABLE`, `RESULT`, `TEST_DATE`, etc.
+        
+        The app automatically detects and handles both formats!
         """)
 
 if __name__ == "__main__":
