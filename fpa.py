@@ -843,7 +843,8 @@ def main():
                 st.header("📊 Data Overview")
                 st.metric("Total Records", f"{len(df):,}")
                 st.metric("Total Athletes", df['ATHLETE_NAME'].nunique())
-                st.metric("Date Range", f"{df['TEST_DATE'].min().strftime('%Y-%m-%d')} to {df['TEST_DATE'].max().strftime('%Y-%m-%d')}")
+                st.metric("Date Range", f"{df['TEST_DATE'].min().strftime('%Y-%m-%d')} \
+                to {df['TEST_DATE'].max().strftime('%Y-%m-%d')}")
                 
                 # Jump type selection
                 st.markdown("---")
