@@ -845,6 +845,17 @@ def main():
                 st.metric("Total Athletes", df['ATHLETE_NAME'].nunique())
                 st.metric("Date Range", f"{df['TEST_DATE'].min().strftime('%Y-%m-%d')} \
                 to {df['TEST_DATE'].max().strftime('%Y-%m-%d')}")
+
+                st.markdown("""
+                        <style>
+                        [data-testid="stMetricValue"] {
+                            font-size: 1.2rem;
+                        }
+                        [data-testid="stMetricLabel"] {
+                            font-size: 0.85rem;
+                        }
+                        </style>
+                    """, unsafe_allow_html=True)
                 
                 # Jump type selection
                 st.markdown("---")
