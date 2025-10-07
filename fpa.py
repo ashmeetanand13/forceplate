@@ -461,7 +461,7 @@ def create_visualizations(pca_results, num_clusters=3):
     athlete_names = list(pca_results['athlete_metrics'].index)
     colors = px.colors.qualitative.Set1
     
-    # 1. PCA Space
+    # 1. PCA Space - Individual athlete colors
     for i, athlete in enumerate(athlete_names):
         fig.add_trace(
             go.Scatter(
@@ -472,7 +472,8 @@ def create_visualizations(pca_results, num_clusters=3):
                 text=[athlete[:15]],
                 textposition="top center",
                 marker=dict(color=colors[i % len(colors)], size=15),
-                showlegend=True
+                showlegend=True,
+                legendgroup='athletes'
             ),
             row=1, col=1
         )
@@ -495,14 +496,26 @@ def create_visualizations(pca_results, num_clusters=3):
         row=2, col=1
     )
     
-    # 3. K-means Clustering
+    # 3. K-means Clustering - CLUSTER COLORS (no legend in main legend)
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     clusters = kmeans.fit_predict(pca_data[:, :3])
 
     cluster_colors = px.colors.qualitative.Set1
+    
+    # Store cluster info for custom legend
+    cluster_info = []
+    
     for cluster in np.unique(clusters):
         mask = clusters == cluster
         cluster_athletes = np.array(athlete_names)[mask]
+        cluster_color = cluster_colors[cluster % len(cluster_colors)]
+        
+        cluster_info.append({
+            'cluster': cluster,
+            'color': cluster_color,
+            'count': len(cluster_athletes)
+        })
+        
         fig.add_trace(
             go.Scatter(
                 x=pca_data[mask, 0],
@@ -511,8 +524,13 @@ def create_visualizations(pca_results, num_clusters=3):
                 name=f'Cluster {cluster + 1}',
                 text=[name[:12] for name in cluster_athletes],
                 textposition="top center",
-                marker=dict(color=cluster_colors[cluster % len(cluster_colors)], size=15),
-                showlegend=True
+                marker=dict(
+                    color=cluster_color, 
+                    size=15,
+                    line=dict(width=2, color='black')
+                ),
+                showlegend=False,
+                legendgroup='clusters'
             ),
             row=3, col=1
         )
@@ -527,7 +545,7 @@ def create_visualizations(pca_results, num_clusters=3):
             y=explained_var,
             marker_color='lightblue',
             name='Individual',
-            showlegend=True
+            showlegend=False,
         ),
         row=4, col=1
     )
@@ -539,19 +557,68 @@ def create_visualizations(pca_results, num_clusters=3):
             mode='lines+markers',
             marker_color='red',
             name='Cumulative',
-            showlegend=True
+            showlegend=False,
         ),
         row=4, col=1
     )
     
-    # Update layout
+    # Update layout with proper margins
     fig.update_layout(
         height=2500,
         title_text="<b>Force Plate Analysis - PCA & Clustering Dashboard</b>",
         title_font_size=20,
         showlegend=True,
+        legend=dict(
+            title="Athletes",
+            orientation="v",
+            yanchor="top",
+            y=0.98,
+            xanchor="left",
+            x=1.01  # Moved slightly closer
+        ),
+        margin=dict(r=200),  # Add right margin for legends
         font=dict(size=12)
     )
+    
+    # Add custom cluster legend as annotations near Row 3
+    legend_y_start = 0.45
+    legend_y_spacing = 0.03
+    
+    # Add title for cluster legend
+    fig.add_annotation(
+        text="<b>Clusters</b>",
+        xref="paper", yref="paper",
+        x=1.01, y=legend_y_start,  # Adjusted x position
+        showarrow=False,
+        font=dict(size=14, color="black"),
+        align="left",
+        xanchor="left"
+    )
+    
+    # Add cluster entries
+    for i, info in enumerate(cluster_info):
+        y_pos = legend_y_start - (i + 1) * legend_y_spacing
+        
+        # Add colored circle
+        fig.add_annotation(
+            text="●",
+            xref="paper", yref="paper",
+            x=1.01, y=y_pos,  # Adjusted x position
+            showarrow=False,
+            font=dict(size=20, color=info['color']),
+            xanchor="left"
+        )
+        
+        # Add cluster label
+        fig.add_annotation(
+            text=f"Cluster {info['cluster'] + 1} ({info['count']})",
+            xref="paper", yref="paper",
+            x=1.035, y=y_pos,  # Adjusted x position
+            showarrow=False,
+            font=dict(size=12, color="black"),
+            align="left",
+            xanchor="left"
+        )
     
     # Update axes labels
     fig.update_xaxes(title_text="<b>Principal Component 1</b>", row=1, col=1, title_font_size=14)
