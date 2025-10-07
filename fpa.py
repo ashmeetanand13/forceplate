@@ -469,11 +469,15 @@ def create_visualizations(pca_results, num_clusters=3):
                 y=[pca_data[i, 1]],
                 mode='markers+text',
                 name=athlete,
-                text=[athlete[:15]],
+                text=[athlete[:15]],  # Truncated for display
                 textposition="top center",
                 marker=dict(color=colors[i % len(colors)], size=15),
                 showlegend=True,
-                legendgroup='athletes'
+                legendgroup='athletes',
+                hovertemplate='<b>%{fullData.name}</b><br>' +  # Full name in hover
+                              'PC1: %{x:.2f}<br>' +
+                              'PC2: %{y:.2f}<br>' +
+                              '<extra></extra>'  # Removes secondary box
             ),
             row=1, col=1
         )
@@ -491,12 +495,15 @@ def create_visualizations(pca_results, num_clusters=3):
             marker_color='lightcoral',
             showlegend=False,
             text=np.round(feature_importance[top_features_idx], 3),
-            textposition='outside'
+            textposition='outside',
+            hovertemplate='<b>%{y}</b><br>' +
+                          'Importance: %{x:.4f}<br>' +
+                          '<extra></extra>'
         ),
         row=2, col=1
     )
     
-    # 3. K-means Clustering - CLUSTER COLORS (no legend in main legend)
+    # 3. K-means Clustering - CLUSTER COLORS
     kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
     clusters = kmeans.fit_predict(pca_data[:, :3])
 
@@ -516,13 +523,16 @@ def create_visualizations(pca_results, num_clusters=3):
             'count': len(cluster_athletes)
         })
         
+        # Get full names and truncated display names
+        display_names = [name[:12] for name in cluster_athletes]
+        
         fig.add_trace(
             go.Scatter(
                 x=pca_data[mask, 0],
                 y=pca_data[mask, 1],
                 mode='markers+text',
                 name=f'Cluster {cluster + 1}',
-                text=[name[:12] for name in cluster_athletes],
+                text=display_names,  # Truncated for display
                 textposition="top center",
                 marker=dict(
                     color=cluster_color, 
@@ -530,7 +540,13 @@ def create_visualizations(pca_results, num_clusters=3):
                     line=dict(width=2, color='black')
                 ),
                 showlegend=False,
-                legendgroup='clusters'
+                legendgroup='clusters',
+                customdata=cluster_athletes,  # Store full names
+                hovertemplate='<b>%{customdata}</b><br>' +  # Full name from customdata
+                              'Cluster: ' + str(cluster + 1) + '<br>' +
+                              'PC1: %{x:.2f}<br>' +
+                              'PC2: %{y:.2f}<br>' +
+                              '<extra></extra>'
             ),
             row=3, col=1
         )
@@ -546,6 +562,9 @@ def create_visualizations(pca_results, num_clusters=3):
             marker_color='lightblue',
             name='Individual',
             showlegend=False,
+            hovertemplate='PC%{x}<br>' +
+                          'Variance: %{y:.1%}<br>' +
+                          '<extra></extra>'
         ),
         row=4, col=1
     )
@@ -558,6 +577,9 @@ def create_visualizations(pca_results, num_clusters=3):
             marker_color='red',
             name='Cumulative',
             showlegend=False,
+            hovertemplate='PC%{x}<br>' +
+                          'Cumulative: %{y:.1%}<br>' +
+                          '<extra></extra>'
         ),
         row=4, col=1
     )
@@ -574,10 +596,11 @@ def create_visualizations(pca_results, num_clusters=3):
             yanchor="top",
             y=0.98,
             xanchor="left",
-            x=1.01  # Moved slightly closer
+            x=1.01
         ),
-        margin=dict(r=200),  # Add right margin for legends
-        font=dict(size=12)
+        margin=dict(r=200),
+        font=dict(size=12),
+        hovermode='closest'  # Better hover behavior
     )
     
     # Add custom cluster legend as annotations near Row 3
@@ -588,7 +611,7 @@ def create_visualizations(pca_results, num_clusters=3):
     fig.add_annotation(
         text="<b>Clusters</b>",
         xref="paper", yref="paper",
-        x=1.01, y=legend_y_start,  # Adjusted x position
+        x=1.01, y=legend_y_start,
         showarrow=False,
         font=dict(size=14, color="black"),
         align="left",
@@ -603,7 +626,7 @@ def create_visualizations(pca_results, num_clusters=3):
         fig.add_annotation(
             text="●",
             xref="paper", yref="paper",
-            x=1.01, y=y_pos,  # Adjusted x position
+            x=1.01, y=y_pos,
             showarrow=False,
             font=dict(size=20, color=info['color']),
             xanchor="left"
@@ -613,7 +636,7 @@ def create_visualizations(pca_results, num_clusters=3):
         fig.add_annotation(
             text=f"Cluster {info['cluster'] + 1} ({info['count']})",
             xref="paper", yref="paper",
-            x=1.035, y=y_pos,  # Adjusted x position
+            x=1.035, y=y_pos,
             showarrow=False,
             font=dict(size=12, color="black"),
             align="left",
