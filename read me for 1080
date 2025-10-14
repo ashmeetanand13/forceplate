@@ -1,0 +1,323 @@
+# 1080 Sprint Analysis - User Guide & Technical Documentation
+
+## Overview
+
+The 1080 Sprint Analysis application is a comprehensive performance analysis tool designed for soccer athletes and teams using the 1080 Sprint system. It provides data-driven insights into sprint performance, injury risk, training optimization, and team progress tracking.
+
+**Key Features:**
+- Athlete clustering and similarity matching
+- Individual performance tracking with statistical analysis
+- Team-wide trend analysis
+- Individual progression from baseline
+- Soccer-specific analytics including injury risk assessment
+
+---
+
+## Application Structure
+
+### Data Loading
+- Accepts CSV files from 1080 Sprint system
+- Automatically parses dates and cleans column names
+- Calculates velocity decrements for each athlete
+- Filters invalid data and handles missing values
+
+### Five Main Analysis Tabs
+
+1. **Clustering & Similarity** - Group athletes and find training partners
+2. **Player Performance** - Track individual metrics over time
+3. **Team Trends** - Compare team performance across time periods
+4. **Individual Progression** - Analyze improvement from baseline
+5. **Soccer Analytics** - Advanced metrics for soccer-specific performance
+
+---
+
+## Core Functions & Formulas
+
+### 1. Statistical Analysis
+
+**T-Test & Effect Size (Cohen's d)**
+```
+p_value = Independent samples t-test
+Pooled SD = √[((n₁-1)×SD₁² + (n₂-1)×SD₂²) / (n₁+n₂-2)]
+Effect Size = (Mean₂ - Mean₁) / Pooled SD
+```
+
+**Purpose:** Compare two sessions statistically to determine if performance changes are significant.
+
+**Interpretation:**
+- p < 0.05: Statistically significant change
+- Effect Size: 0.2 (small), 0.5 (medium), 0.8 (large)
+
+---
+
+### 2. Clustering Analysis
+
+**Method:** K-Means clustering with PCA visualization
+
+**Features Used:**
+- Max Speed
+- Average Speed
+- Best Acceleration (0-5m time)
+- Consistency (standard deviation)
+- Load Retention (speed maintained under load)
+
+**Formula for Retention:**
+```
+Retention (%) = (Heavy Load Speed / Light Load Speed) × 100
+```
+
+**Purpose:** Groups athletes with similar performance profiles for targeted training and identifying training partners.
+
+---
+
+### 3. Similarity Matching
+
+**Distance Formula (Normalized Euclidean):**
+```
+Distance = √[Σ(target - athlete)²] / √(number of metrics)
+Similarity = 100 / (1 + Distance)
+```
+
+**Metrics Compared:**
+- Max Speed
+- Average Speed
+- Best 0-5m Time
+
+**Result:** Similarity score 0-100 (higher = more similar)
+
+**Purpose:** Find athletes with similar performance profiles for paired training.
+
+---
+
+### 4. Optimal Power Zone Analysis
+
+**Power Formula (Horizontal Power):**
+```
+Power = (Athlete Weight + Load) × Average Acceleration × Average Speed
+Units: kg × m/s² × m/s = Watts
+```
+
+**Training Zones:**
+- **Speed Zone:** Lightest 33% of loads OR up to 70% of optimal load
+  - Focus: Maximum velocity development
+  - Exercises: Overspeed training, flying sprints, light sled
+
+- **Power Zone:** ±20% around optimal load (clamped to tested range)
+  - Focus: Maximum power output
+  - Exercises: Resisted sprints, explosive starts
+
+- **Strength Zone:** 130% of optimal to maximum tested
+  - Focus: Force production
+  - Exercises: Heavy sled pushes, hill sprints
+
+**Safety:** All zones are capped within tested load ranges to prevent invalid recommendations.
+
+---
+
+### 5. Acceleration Dominance Profile
+
+**Velocity-Acceleration Ratio:**
+```
+Ratio = Max Speed (m/s) / Best 0-5m Time (s)
+```
+
+**Classification:**
+- Ratio > 8.5: Top Speed Dominant (high max speed, slower acceleration)
+- Ratio 7.0-8.5: Balanced profile
+- Ratio < 7.0: Acceleration Dominant (explosive start, lower top speed)
+
+**Example:**
+- Elite sprinter: 10.0 m/s ÷ 1.0s = 10.0 (Speed Dominant)
+- Soccer player: 8.0 m/s ÷ 1.05s = 7.6 (Balanced)
+
+**Purpose:** Identifies athlete's strength to guide training focus.
+
+---
+
+### 6. Asymmetry Analysis
+
+**Asymmetry Percentage:**
+```
+Asymmetry (%) = |Left - Right| / Max(Left, Right) × 100
+```
+
+**Risk Levels:**
+- Low Risk: < 5% asymmetry
+- Moderate Risk: 5-10% asymmetry
+- High Risk: > 10% asymmetry
+
+**Purpose:** Identify left/right imbalances that may increase injury risk. High asymmetries require corrective exercises and unilateral training.
+
+---
+
+### 7. Eccentric Strength Analysis
+
+**Eccentric:Concentric Ratio:**
+```
+Ratio = Average Eccentric Load / Average Concentric Load
+```
+
+**Capacity Assessment:**
+- Excellent: Ratio > 1.4 (handles 40%+ more eccentric)
+- Good: Ratio 1.2-1.4 (typical 20-40% more)
+- Developing: Ratio 1.0-1.2
+- Needs Development: Ratio < 1.0
+
+**Quality Check:** Requires minimum 5 sessions with eccentric data.
+
+**Purpose:** Eccentric strength is critical for deceleration, change of direction, and injury prevention in soccer.
+
+---
+
+### 8. Power Endurance
+
+**Sprint Decrement:**
+```
+Decrement (%) = [(First 3 Sprints Avg - Last 3 Sprints Avg) / First 3 Sprints Avg] × 100
+```
+
+**Scoring:**
+- Excellent: < 3% decrement
+- Good: 3-5% decrement
+- Moderate: 5-8% decrement
+- Poor: > 8% decrement
+
+**Purpose:** Measures ability to maintain power output throughout a session. Important for repeated sprint sports like soccer.
+
+---
+
+### 9. Injury Risk Assessment
+
+**Multi-Factor Scoring System (Total: 100 points)**
+
+**Risk Factors:**
+1. **Asymmetry (35 points max)**
+   - High asymmetry (>10%): +35 points
+   - Moderate asymmetry (5-10%): +20 points
+
+2. **Recent Performance Drop (35 points max)**
+   - Compares last 3 sessions vs previous 3 sessions
+   - Drop > 5%: +35 points
+
+3. **High Variability (30 points max)**
+   - Coefficient of Variation > 10%: +30 points
+
+**Overall Risk:**
+- Low Risk (0-24): Continue current program
+- Moderate Risk (25-49): Monitor closely, consider lighter loads
+- High Risk (50+): Reduce training load, corrective exercises
+
+**Purpose:** Comprehensive injury risk screening combining multiple performance indicators.
+
+---
+
+### 10. Performance Prediction (EWMA)
+
+**Exponential Weighted Moving Average:**
+```
+EWMA[i] = α × Speed[i] + (1-α) × EWMA[i-1]
+Where α = 0.3 (30% weight to recent sessions)
+```
+
+**Trend Calculation:**
+- Uses linear regression on last 5 EWMA points
+- Calculates trend rate (m/s per day)
+
+**Prediction with Dampening:**
+```
+Raw Prediction = Current Speed + (Trend Rate × Days Ahead)
+Dampening Factor = 1.0 - (Days Ahead / 100)
+Damped Prediction = Current + (Raw - Current) × Dampening Factor
+```
+
+**Caps:** Predictions limited to ±5% from current max speed
+
+**Trend Classification:**
+- Improving: Trend > +0.002 m/s/day (+0.06 m/s/month)
+- Declining: Trend < -0.002 m/s/day (-0.06 m/s/month)
+- Stable: Between -0.002 and +0.002 m/s/day
+
+**Purpose:** Provides realistic performance predictions that account for:
+- Recent data weighted more heavily
+- Natural adaptation curves (dampening)
+- Biological limits (capping)
+
+---
+
+## Tab-Specific Features
+
+### Tab 1: Clustering & Similarity
+**What it does:**
+- Groups athletes into 3 performance clusters
+- Visualizes clusters using PCA (2D projection)
+- Finds most similar athletes for training partnerships
+- Classifies athletes as Force-Dominant, Velocity-Dominant, or Balanced
+
+### Tab 2: Player Performance
+**What it does:**
+- Tracks max speed, acceleration, and consistency over time
+- Shows trend lines for performance metrics
+- Displays load-velocity profiles
+- Provides session-by-session performance summaries
+
+### Tab 3: Team Trends
+**What it does:**
+- Compares team performance between two time periods (date ranges)
+- Shows which athletes improved vs declined
+- Calculates statistical significance for each athlete
+- Provides team-wide improvement rate and recommendations
+- **Note:** Now uses date ranges instead of exact dates to show whole team
+
+### Tab 4: Individual Progression
+**What it does:**
+- Tracks athlete improvement from baseline session
+- Shows every session compared to baseline with statistics
+- Color codes: Green (improved), Red (declined), Gray (baseline)
+- Provides trend analysis and downloadable progress reports
+
+### Tab 5: Soccer Analytics
+**What it does:**
+Three sub-sections:
+
+**Training Prescription:**
+- Calculates optimal power load
+- Defines personalized training zones
+- Provides weekly training plan suggestions
+
+**Injury Risk & Asymmetry:**
+- Comprehensive injury risk score (0-100)
+- Left/right asymmetry analysis
+- Eccentric strength capacity assessment
+
+**Performance Analysis:**
+- Acceleration dominance profile
+- Power endurance scoring
+- Performance trend predictions (7, 14, 30 days)
+
+---
+
+## Best Practices for Use
+
+### Data Quality
+- Ensure consistent date formatting in CSV files
+- Include athlete weight data for accurate power calculations
+- Tag sprints with Left/Right side for asymmetry analysis
+- Record eccentric loads when applicable
+
+### Analysis Recommendations
+- **Minimum sessions:** 3-5 sessions for reliable trends
+- **Baseline periods:** Use 2-4 week windows for team trends
+- **Injury risk:** Check weekly for high-risk athletes
+- **Training zones:** Retest every 4-6 weeks as athletes adapt
+
+### Interpretation Guidelines
+- Small improvements (1-2%) may not be statistically significant
+- Consistency (low CV%) is as important as peak performance
+- Asymmetries > 10% require immediate attention
+- Declining trends over 2+ weeks warrant program review
+
+---
+
+
+
+*Document Version 1.0 - Updated after comprehensive code review and optimization*
