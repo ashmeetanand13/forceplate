@@ -41,10 +41,21 @@ def load_data(uploaded_file):
         df.columns = df.columns.str.strip()
         
         # Parse dates
+        # Parse dates - try multiple formats
         df['SessionTime_clean'] = df['SessionTime'].astype(str).str.split(' -').str[0]
         df['SessionDateTime'] = pd.to_datetime(df['SessionTime_clean'], format='%m/%d/%Y %I:%M:%S %p', errors='coerce')
+        
         if df['SessionDateTime'].isna().all():
             df['SessionDateTime'] = pd.to_datetime(df['SessionTime'], errors='coerce')
+        
+        # Ensure column is datetime type before using .dt accessor
+        if not pd.api.types.is_datetime64_any_dtype(df['SessionDateTime']):
+            df['SessionDateTime'] = pd.to_datetime(df['SessionDateTime'], errors='coerce')
+        
+        # Check if we have any valid dates
+        if df['SessionDateTime'].isna().all():
+            st.error("Could not parse any dates from 'SessionTime' column. Check date format.")
+            return None
         
         df['SessionDate'] = df['SessionDateTime'].dt.date
         df = df[df['SessionDate'].notna() & df['TopSpeed'].notna()].copy()
