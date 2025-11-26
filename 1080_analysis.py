@@ -39,6 +39,11 @@ def load_data(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
         df.columns = df.columns.str.strip()
+
+        # Standardize acceleration column name (handle both meters and yards)
+        if '0-5yd Time [s]' in df.columns and '0-5m Time [s]' not in df.columns:
+            df['0-5m Time [s]'] = df['0-5yd Time [s]']
+
         
         # Parse dates
         # Parse dates - try multiple formats
