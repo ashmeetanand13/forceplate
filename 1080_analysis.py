@@ -698,13 +698,15 @@ with tab2:
         line=dict(color='#3b82f6', width=3), marker=dict(size=10)
     ))
     
-    # Trend line
-    x_num = np.arange(len(progress))
-    z = np.polyfit(x_num, progress[col].values, 1)
-    fig.add_trace(go.Scatter(
-        x=progress['SessionDate'], y=np.poly1d(z)(x_num),
-        mode='lines', name='Trend',
-        line=dict(color='red', dash='dash', width=2)
+# Trend line (need at least 2 points)
+    if len(progress) >= 2:
+        x_num = np.arange(len(progress))
+        z = np.polyfit(x_num, progress[col].dropna().values, 1)
+        fig.add_trace(go.Scatter(
+            x=progress['SessionDate'], y=np.poly1d(z)(x_num),
+            mode='lines', name='Trend',
+            line=dict(color='red', dash='dash', width=2)
+
     ))
     
     fig.update_layout(
@@ -734,10 +736,6 @@ with tab2:
         height=350, template='plotly_white'
     )
     st.plotly_chart(fig, use_container_width=True)
-
-# ============================================================================
-# TAB 3: TEAM TRENDS
-# ============================================================================
 
 # ============================================================================
 # TAB 3: TEAM TRENDS
