@@ -2157,4 +2157,4 @@ with tab6:
 
 # Footer
 st.markdown("---")
-st.caption("1080 Sprint Analysis | Statistical testing • Machine learning • Soccer-specific analytics")
+st.caption("1080 Sprint Analysis | Statistical testing • Machine learning • Soccer-specific analytics | By: Ash")
