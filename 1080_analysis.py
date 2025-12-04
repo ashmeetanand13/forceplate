@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -433,6 +432,261 @@ def calculate_injury_risk(df, athlete):
         'recommendation': recommendation
     }
 
+# ============================================================================
+# LOAD-VELOCITY PROFILE FUNCTIONS
+# ============================================================================
+
+def calculate_fv_profile(df, athlete, session_date):
+    """
+    Calculate Force-Velocity profile for a specific session.
+    Returns F0, V0, Pmax derived from linear regression of Load vs Velocity.
+    """
+    session_data = df[(df['Client'] == athlete) & (df['SessionDate'] == session_date)]
+    
+    if len(session_data) < 2:
+        return None
+    
+    # Get max velocity at each load for this session
+    load_velocity = session_data.groupby('Concentric Load [kg]')['TopSpeed'].max().reset_index()
+    load_velocity = load_velocity.sort_values('Concentric Load [kg]')
+    
+    if len(load_velocity) < 2:
+        return None
+    
+    loads = load_velocity['Concentric Load [kg]'].values
+    velocities = load_velocity['TopSpeed'].values
+    
+    # Get athlete weight
+    weight = session_data['Client Weight [kg]'].iloc[0]
+    
+    # Linear regression: Velocity = V0 - (V0/F0) * Force
+    # Where Force = (body_weight + load) * acceleration (simplified as load for relative comparison)
+    # For F-V profiling, we use total system mass
+    total_mass = weight + loads
+    
+    # Fit linear regression: V = V0 - slope * Load
+    # slope = V0 / F0 (relative)
+    X = loads.reshape(-1, 1)
+    y = velocities
+    
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # V0 = y-intercept (theoretical max velocity at 0 load)
+    V0 = model.intercept_
+    
+    # Slope = -V0/F0, so F0 = -V0/slope
+    slope = model.coef_[0]
+    
+    if slope >= 0:  # Invalid profile (velocity should decrease with load)
+        return None
+    
+    # F0 in terms of load (kg) - theoretical max load at 0 velocity
+    F0_load = -V0 / slope
+    
+    # Convert to Newtons: F0 = (body_weight + F0_load) * g
+    F0_newtons = (weight + F0_load) * 9.81
+    
+    # Pmax = F0 * V0 / 4 (from F-V relationship)
+    Pmax = (F0_newtons * V0) / 4
+    
+    # R-squared for quality assessment
+    y_pred = model.predict(X)
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+    
+    return {
+        'date': session_date,
+        'V0': V0,
+        'F0_load': F0_load,
+        'F0_newtons': F0_newtons,
+        'Pmax': Pmax,
+        'slope': slope,
+        'r_squared': r_squared,
+        'loads': loads,
+        'velocities': velocities,
+        'weight': weight,
+        'n_points': len(loads)
+    }
+
+
+def get_sessions_with_fv_data(df, athlete, min_loads=2):
+    """Get list of sessions that have enough load variation for F-V profiling."""
+    athlete_data = df[df['Client'] == athlete]
+    sessions = []
+    
+    for date in sorted(athlete_data['SessionDate'].unique()):
+        session_data = athlete_data[athlete_data['SessionDate'] == date]
+        n_loads = session_data['Concentric Load [kg]'].nunique()
+        
+        if n_loads >= min_loads:
+            sessions.append({
+                'date': date,
+                'n_loads': n_loads,
+                'n_sprints': len(session_data),
+                'load_range': f"{session_data['Concentric Load [kg]'].min():.0f}-{session_data['Concentric Load [kg]'].max():.0f} kg"
+            })
+    
+    return sessions
+
+
+# ============================================================================
+# ENHANCED ASYMMETRY FUNCTIONS
+# ============================================================================
+
+def analyze_asymmetry_detailed(df, athlete, session_date=None):
+    """
+    Detailed asymmetry analysis with load matching.
+    If session_date is None, analyzes all data.
+    """
+    if session_date:
+        athlete_data = df[(df['Client'] == athlete) & (df['SessionDate'] == session_date)]
+    else:
+        athlete_data = df[df['Client'] == athlete]
+    
+    # Filter to only rows with Side data
+    athlete_data = athlete_data[athlete_data['Side'].isin(['Left', 'Right'])]
+    
+    if len(athlete_data) == 0:
+        return None
+    
+    left_data = athlete_data[athlete_data['Side'] == 'Left']
+    right_data = athlete_data[athlete_data['Side'] == 'Right']
+    
+    if len(left_data) == 0 or len(right_data) == 0:
+        return None
+    
+    # Overall metrics
+    results = {
+        'left_count': len(left_data),
+        'right_count': len(right_data),
+        'metrics': {}
+    }
+    
+    # Analyze multiple metrics
+    metrics_to_analyze = [
+        ('TopSpeed', 'Max Speed (m/s)', 'max'),
+        ('MaxAcceleration', 'Max Acceleration (m/s²)', 'max'),
+        ('0-5m Time [s]', '0-5m Time (s)', 'min')
+    ]
+    
+    for col, label, agg_func in metrics_to_analyze:
+        if col not in athlete_data.columns:
+            continue
+            
+        if agg_func == 'max':
+            left_val = left_data[col].max()
+            right_val = right_data[col].max()
+        else:
+            left_val = left_data[col].min()
+            right_val = right_data[col].min()
+        
+        if pd.isna(left_val) or pd.isna(right_val):
+            continue
+        
+        avg_val = (left_val + right_val) / 2
+        
+        # Asymmetry Index: (Left - Right) / Average * 100
+        # Positive = Left dominant, Negative = Right dominant
+        asymmetry = ((left_val - right_val) / avg_val) * 100 if avg_val > 0 else 0
+        
+        # For time metrics, flip the sign (lower is better)
+        if 'Time' in col:
+            asymmetry = -asymmetry  # Now positive = Left faster (better)
+        
+        abs_asymmetry = abs(asymmetry)
+        
+        # Risk classification
+        if abs_asymmetry < 5:
+            risk = 'Low'
+            color = '#10b981'  # Green
+        elif abs_asymmetry < 10:
+            risk = 'Moderate'
+            color = '#f59e0b'  # Yellow
+        else:
+            risk = 'High'
+            color = '#ef4444'  # Red
+        
+        dominant_side = 'Left' if asymmetry > 0 else 'Right' if asymmetry < 0 else 'Balanced'
+        
+        results['metrics'][col] = {
+            'label': label,
+            'left': left_val,
+            'right': right_val,
+            'asymmetry': asymmetry,
+            'abs_asymmetry': abs_asymmetry,
+            'risk': risk,
+            'color': color,
+            'dominant': dominant_side
+        }
+    
+    return results
+
+
+def get_asymmetry_trend(df, athlete):
+    """Track asymmetry changes over time."""
+    athlete_data = df[df['Client'] == athlete]
+    dates = sorted(athlete_data['SessionDate'].unique())
+    
+    trend_data = []
+    
+    for date in dates:
+        asym = analyze_asymmetry_detailed(df, athlete, date)
+        if asym and 'TopSpeed' in asym['metrics']:
+            trend_data.append({
+                'date': date,
+                'speed_asymmetry': asym['metrics']['TopSpeed']['abs_asymmetry'],
+                'speed_dominant': asym['metrics']['TopSpeed']['dominant'],
+                'accel_asymmetry': asym['metrics'].get('MaxAcceleration', {}).get('abs_asymmetry', np.nan),
+                'left_speed': asym['metrics']['TopSpeed']['left'],
+                'right_speed': asym['metrics']['TopSpeed']['right']
+            })
+    
+    return pd.DataFrame(trend_data) if trend_data else None
+
+
+def get_load_matched_asymmetry(df, athlete, session_date=None):
+    """Compare L/R performance at matching loads."""
+    if session_date:
+        athlete_data = df[(df['Client'] == athlete) & (df['SessionDate'] == session_date)]
+    else:
+        athlete_data = df[df['Client'] == athlete]
+    
+    athlete_data = athlete_data[athlete_data['Side'].isin(['Left', 'Right'])]
+    
+    if len(athlete_data) == 0:
+        return None
+    
+    # Find loads that have both L and R data
+    left_loads = set(athlete_data[athlete_data['Side'] == 'Left']['Concentric Load [kg]'].unique())
+    right_loads = set(athlete_data[athlete_data['Side'] == 'Right']['Concentric Load [kg]'].unique())
+    common_loads = left_loads & right_loads
+    
+    if len(common_loads) == 0:
+        return None
+    
+    results = []
+    for load in sorted(common_loads):
+        left = athlete_data[(athlete_data['Side'] == 'Left') & (athlete_data['Concentric Load [kg]'] == load)]
+        right = athlete_data[(athlete_data['Side'] == 'Right') & (athlete_data['Concentric Load [kg]'] == load)]
+        
+        left_speed = left['TopSpeed'].max()
+        right_speed = right['TopSpeed'].max()
+        avg_speed = (left_speed + right_speed) / 2
+        asymmetry = ((left_speed - right_speed) / avg_speed) * 100 if avg_speed > 0 else 0
+        
+        results.append({
+            'load': load,
+            'left_speed': left_speed,
+            'right_speed': right_speed,
+            'asymmetry': asymmetry,
+            'abs_asymmetry': abs(asymmetry)
+        })
+    
+    return pd.DataFrame(results)
+
+
 def predict_performance(df, athlete):
     """Performance trend predictor using EWMA (Exponential Weighted Moving Average)"""
     athlete_data = df[df['Client'] == athlete].copy()
@@ -563,9 +817,11 @@ if st.session_state.data is None:
     st.markdown("""
     ### Features:
     - **🔬 Clustering & Similarity**: Find athlete groups and training partners
-    - **📈 Performance Tracking**: Monitor all key metrics over time
+    - **📈 Player Analysis**: Performance tracking, baseline progression & load-velocity profiles
     - **👥 Team Trends**: Analyze team-wide improvements
-    - **🎯 Individual Progression**: Track from baseline with statistics
+    - **⚽ Soccer Analytics**: Sport-specific insights and injury risk
+    - **📊 Load-Velocity Profiles**: Compare F-V profiles across sessions
+    - **⚖️ Asymmetry Analysis**: Left/Right imbalance tracking
     """)
     st.stop()
 
@@ -577,12 +833,13 @@ dates = sorted(df['SessionDate'].unique())
 # MAIN TABS
 # ============================================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "🔬 Clustering & Similarity",
-    "📈 Player Performance",
+    "📈 Player Analysis",
     "👥 Team Trends",
-    "🎯 Individual Progression",
-    "⚽ Soccer Analytics"
+    "⚽ Soccer Analytics",
+    "📊 Load-Velocity Profiles",
+    "⚖️ Asymmetry Analysis"
 ])
 
 # ============================================================================
@@ -645,17 +902,17 @@ with tab1:
                 st.warning("**Profile:** Velocity-Dominant 🏃\n\nFocus: Strength work")
 
 # ============================================================================
-# TAB 2: PLAYER PERFORMANCE
+# TAB 2: PLAYER ANALYSIS (Merged Performance + Progression)
 # ============================================================================
 
 with tab2:
-    st.header("📈 Player Performance Over Time")
+    st.header("📈 Player Analysis")
     
-    selected_athlete = st.selectbox("Select Athlete", athletes, key='performance')
+    selected_athlete = st.selectbox("Select Athlete", athletes, key='player_analysis')
     athlete_data = df[df['Client'] == selected_athlete]
     athlete_dates = sorted(athlete_data['SessionDate'].unique())
     
-    # Summary Metrics
+    # Summary Metrics Row
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("Max Speed", f"{athlete_data['TopSpeed'].max():.2f} m/s")
@@ -671,71 +928,252 @@ with tab2:
     
     st.markdown("---")
     
-    # Metrics over time
-    progress = athlete_data.groupby('SessionDate').agg({
-        'TopSpeed': 'max',
-        '0-5m Time [s]': 'min',
-        'MaxAcceleration': 'max'
-    }).reset_index().sort_values('SessionDate')
+    # Create sub-sections
+    perf_tab1, perf_tab2, perf_tab3 = st.tabs([
+        "📊 Performance Over Time",
+        "🎯 Baseline Progression",
+        "📉 Load-Velocity Profile"
+    ])
     
-    # Multi-metric chart
-    metric_choice = st.selectbox("Select Metric", 
-                                  ["Max Speed", "0-5m Time", "Max Acceleration"],
-                                  key='metric')
-    
-    metric_map = {
-        "Max Speed": ('TopSpeed', 'Speed (m/s)', False),
-        "0-5m Time": ('0-5m Time [s]', 'Time (s)', True),
-        "Max Acceleration": ('MaxAcceleration', 'Acceleration (m/s²)', False)
-    }
-    
-    col, ylabel, invert = metric_map[metric_choice]
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=progress['SessionDate'], y=progress[col],
-        mode='lines+markers', name=metric_choice,
-        line=dict(color='#3b82f6', width=3), marker=dict(size=10)
-    ))
-    
-# Trend line (need at least 2 points)
-    if len(progress) >= 2:
-        x_num = np.arange(len(progress))
-        z = np.polyfit(x_num, progress[col].dropna().values, 1)
+    # ========================================================================
+    # SUB-TAB 1: Performance Over Time
+    # ========================================================================
+    with perf_tab1:
+        # Metrics over time
+        progress = athlete_data.groupby('SessionDate').agg({
+            'TopSpeed': 'max',
+            '0-5m Time [s]': 'min',
+            'MaxAcceleration': 'max'
+        }).reset_index().sort_values('SessionDate')
+        
+        metric_choice = st.selectbox("Select Metric", 
+                                      ["Max Speed", "0-5m Time", "Max Acceleration"],
+                                      key='metric_perf')
+        
+        metric_map = {
+            "Max Speed": ('TopSpeed', 'Speed (m/s)', False),
+            "0-5m Time": ('0-5m Time [s]', 'Time (s)', True),
+            "Max Acceleration": ('MaxAcceleration', 'Acceleration (m/s²)', False)
+        }
+        
+        col, ylabel, invert = metric_map[metric_choice]
+        
+        fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=progress['SessionDate'], y=np.poly1d(z)(x_num),
-            mode='lines', name='Trend',
-            line=dict(color='red', dash='dash', width=2)
-
-    ))
+            x=progress['SessionDate'], y=progress[col],
+            mode='lines+markers', name=metric_choice,
+            line=dict(color='#3b82f6', width=3), marker=dict(size=10)
+        ))
+        
+        # Trend line
+        if len(progress) >= 2:
+            x_num = np.arange(len(progress))
+            valid_data = progress[col].dropna()
+            if len(valid_data) >= 2:
+                z = np.polyfit(x_num[:len(valid_data)], valid_data.values, 1)
+                fig.add_trace(go.Scatter(
+                    x=progress['SessionDate'], y=np.poly1d(z)(x_num),
+                    mode='lines', name='Trend',
+                    line=dict(color='red', dash='dash', width=2)
+                ))
+        
+        fig.update_layout(
+            xaxis_title='Date', yaxis_title=ylabel,
+            height=400, template='plotly_white', hovermode='x unified'
+        )
+        if invert:
+            fig.update_yaxes(autorange='reversed')
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Quick stats for this metric
+        if len(progress) >= 2:
+            first_val = progress[col].iloc[0]
+            last_val = progress[col].iloc[-1]
+            if invert:
+                change_pct = ((first_val - last_val) / first_val) * 100
+            else:
+                change_pct = ((last_val - first_val) / first_val) * 100
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("First Session", f"{first_val:.2f}")
+            with col2:
+                st.metric("Latest Session", f"{last_val:.2f}")
+            with col3:
+                st.metric("Total Change", f"{change_pct:+.1f}%")
     
-    fig.update_layout(
-        xaxis_title='Date', yaxis_title=ylabel,
-        height=400, template='plotly_white', hovermode='x unified'
-    )
-    if invert:
-        fig.update_yaxes(autorange='reversed')
+    # ========================================================================
+    # SUB-TAB 2: Baseline Progression
+    # ========================================================================
+    with perf_tab2:
+        if len(athlete_dates) < 2:
+            st.warning(f"⚠️ {selected_athlete} needs at least 2 sessions for progression analysis")
+        else:
+            baseline = athlete_dates[0]
+            baseline_stats = get_session_stats(df, selected_athlete, baseline)
+            
+            # Header info
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.info(f"**Baseline:** {baseline}")
+            with col2:
+                st.info(f"**Sessions:** {len(athlete_dates)}")
+            with col3:
+                st.info(f"**Period:** {(athlete_dates[-1] - baseline).days} days")
+            
+            # Calculate progression
+            progression = []
+            for date in athlete_dates[1:]:
+                session_stats = get_session_stats(df, selected_athlete, date)
+                if session_stats:
+                    speed_change = session_stats['max_speed'] - baseline_stats['max_speed']
+                    p_val, effect = calculate_stats(baseline_stats['speeds'], session_stats['speeds'])
+                    
+                    progression.append({
+                        'Date': date,
+                        'Days': (date - baseline).days,
+                        'Max Speed': session_stats['max_speed'],
+                        'Change': speed_change,
+                        'Change (%)': (speed_change / baseline_stats['max_speed']) * 100,
+                        'P-Value': p_val,
+                        'Effect': effect,
+                        'Improved': speed_change > 0
+                    })
+            
+            if len(progression) > 0:
+                prog_df = pd.DataFrame(progression)
+                
+                # Summary metrics
+                improved = prog_df['Improved'].sum()
+                total = len(prog_df)
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Improved Sessions", f"{improved}/{total}")
+                with col2:
+                    st.metric("Avg Improvement", f"{prog_df['Change (%)'].mean():+.1f}%")
+                with col3:
+                    st.metric("Latest Speed", f"{prog_df.iloc[-1]['Max Speed']:.2f} m/s")
+                with col4:
+                    st.metric("Total Gain", f"{prog_df.iloc[-1]['Change']:+.2f} m/s")
+                
+                # Insight
+                if improved / total >= 0.75:
+                    st.markdown('<div class="success-box">🌟 <b>Excellent Progression!</b> ' +
+                               f'{improved}/{total} sessions faster than baseline.</div>',
+                               unsafe_allow_html=True)
+                elif improved / total >= 0.5:
+                    st.markdown('<div class="info-box">📈 <b>Positive Progress:</b> ' +
+                               f'{improved}/{total} sessions show improvement.</div>',
+                               unsafe_allow_html=True)
+                else:
+                    st.markdown('<div class="warning-box">⚠️ <b>Review Needed:</b> ' +
+                               f'Only {improved}/{total} sessions improved.</div>',
+                               unsafe_allow_html=True)
+                
+                st.markdown("---")
+                
+                # Progression Chart
+                all_dates = [baseline] + list(prog_df['Date'])
+                all_speeds = [baseline_stats['max_speed']] + list(prog_df['Max Speed'])
+                colors = ['gray'] + ['green' if x else 'red' for x in prog_df['Improved']]
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=all_dates, y=all_speeds,
+                    mode='lines+markers',
+                    line=dict(color='#3b82f6', width=3),
+                    marker=dict(size=12, color=colors, line=dict(width=2, color='white')),
+                    name='Max Speed'
+                ))
+                
+                # Baseline reference line
+                fig.add_hline(y=baseline_stats['max_speed'], line_dash="dash", 
+                             line_color="gray", annotation_text="Baseline")
+                
+                fig.update_layout(
+                    xaxis_title='Date', yaxis_title='Max Speed (m/s)',
+                    height=400, template='plotly_white'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("⭐ Gray = Baseline | 🟢 Green = Improved | 🔴 Red = Declined")
+                
+                # Detailed Table
+                st.subheader("Session Details")
+                display_prog = prog_df.copy()
+                display_prog['Date'] = display_prog['Date'].astype(str)
+                display_prog['Max Speed'] = display_prog['Max Speed'].apply(lambda x: f"{x:.2f}")
+                display_prog['Change'] = display_prog['Change'].apply(lambda x: f"{x:+.3f}")
+                display_prog['Change (%)'] = display_prog['Change (%)'].apply(lambda x: f"{x:+.1f}%")
+                display_prog['P-Value'] = display_prog['P-Value'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+                display_prog['Status'] = display_prog['Improved'].apply(lambda x: "🟢" if x else "🔴")
+                
+                st.dataframe(display_prog[['Date', 'Days', 'Max Speed', 'Change', 'Change (%)', 'P-Value', 'Status']], 
+                             use_container_width=True)
+                
+                # Download button
+                csv = prog_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Progression Data", csv, 
+                                  f"{selected_athlete.replace(' ', '_')}_progression.csv", "text/csv")
     
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Load-Velocity Profile
-    st.markdown("---")
-    st.subheader("Load-Velocity Profile")
-    
-    lv_data = athlete_data.groupby('Concentric Load [kg]')['TopSpeed'].max().reset_index()
-    lv_data = lv_data.sort_values('Concentric Load [kg]')
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=lv_data['Concentric Load [kg]'], y=lv_data['TopSpeed'],
-        mode='lines+markers', line=dict(color='#10b981', width=3), marker=dict(size=10)
-    ))
-    
-    fig.update_layout(
-        xaxis_title='Load (kg)', yaxis_title='Max Velocity (m/s)',
-        height=350, template='plotly_white'
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    # ========================================================================
+    # SUB-TAB 3: Load-Velocity Profile
+    # ========================================================================
+    with perf_tab3:
+        lv_data = athlete_data.groupby('Concentric Load [kg]')['TopSpeed'].max().reset_index()
+        lv_data = lv_data.sort_values('Concentric Load [kg]')
+        
+        if len(lv_data) < 2:
+            st.warning("Need at least 2 different loads for Load-Velocity profile")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=lv_data['Concentric Load [kg]'], y=lv_data['TopSpeed'],
+                mode='lines+markers', 
+                line=dict(color='#10b981', width=3), 
+                marker=dict(size=12)
+            ))
+            
+            # Add regression line
+            X = lv_data['Concentric Load [kg]'].values.reshape(-1, 1)
+            y = lv_data['TopSpeed'].values
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            x_range = np.linspace(lv_data['Concentric Load [kg]'].min(), 
+                                  lv_data['Concentric Load [kg]'].max(), 50)
+            y_pred = model.predict(x_range.reshape(-1, 1))
+            
+            fig.add_trace(go.Scatter(
+                x=x_range, y=y_pred,
+                mode='lines', name='Linear Fit',
+                line=dict(color='red', dash='dash', width=2)
+            ))
+            
+            fig.update_layout(
+                xaxis_title='Load (kg)', yaxis_title='Max Velocity (m/s)',
+                height=400, template='plotly_white'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Quick metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Loads Tested", len(lv_data))
+            with col2:
+                st.metric("Speed at Min Load", f"{lv_data['TopSpeed'].iloc[0]:.2f} m/s")
+            with col3:
+                retention = (lv_data['TopSpeed'].iloc[-1] / lv_data['TopSpeed'].iloc[0]) * 100
+                st.metric("Velocity Retention", f"{retention:.1f}%")
+            
+            # Profile interpretation
+            if retention > 65:
+                st.success("**Force-Dominant Profile** 💪 - Good velocity maintenance under load. Focus: Max velocity work")
+            elif retention > 50:
+                st.info("**Balanced Profile** ⚖️ - Continue mixed training approach")
+            else:
+                st.warning("**Velocity-Dominant Profile** 🏃 - Speed drops significantly with load. Focus: Strength work")
 
 # ============================================================================
 # TAB 3: TEAM TRENDS
@@ -901,141 +1339,10 @@ with tab3:
                  use_container_width=True)
 
 # ============================================================================
-# TAB 4: INDIVIDUAL PROGRESSION
+# TAB 4: SOCCER ANALYTICS
 # ============================================================================
 
 with tab4:
-    st.header("🎯 Individual Progression from Baseline")
-    
-    selected_athlete = st.selectbox("Select Athlete", athletes, key='progression')
-    athlete_data = df[df['Client'] == selected_athlete]
-    athlete_dates = sorted(athlete_data['SessionDate'].unique())
-    
-    if len(athlete_dates) < 2:
-        st.warning(f"⚠️ {selected_athlete} needs at least 2 sessions")
-        st.stop()
-    
-    baseline = athlete_dates[0]
-    baseline_stats = get_session_stats(df, selected_athlete, baseline)
-    
-    # Header info
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.info(f"**Baseline:** {baseline}")
-    with col2:
-        st.info(f"**Sessions:** {len(athlete_dates)}")
-    with col3:
-        st.info(f"**Period:** {(athlete_dates[-1] - baseline).days} days")
-    
-    st.markdown("---")
-    
-    # Calculate progression
-    progression = []
-    for date in athlete_dates[1:]:
-        session_stats = get_session_stats(df, selected_athlete, date)
-        if session_stats:
-            speed_change = session_stats['max_speed'] - baseline_stats['max_speed']
-            p_val, effect = calculate_stats(baseline_stats['speeds'], session_stats['speeds'])
-            
-            progression.append({
-                'Date': date,
-                'Days': (date - baseline).days,
-                'Max Speed': session_stats['max_speed'],
-                'Change': speed_change,
-                'Change (%)': (speed_change / baseline_stats['max_speed']) * 100,
-                'P-Value': p_val,
-                'Effect': effect,
-                'Improved': speed_change > 0
-            })
-    
-    prog_df = pd.DataFrame(progression)
-    
-    # Summary
-    improved = prog_df['Improved'].sum()
-    total = len(prog_df)
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Improved Sessions", f"{improved}/{total}")
-    with col2:
-        st.metric("Avg Improvement", f"{prog_df['Change (%)'].mean():+.1f}%")
-    with col3:
-        st.metric("Latest Speed", f"{prog_df.iloc[-1]['Max Speed']:.2f} m/s")
-    with col4:
-        st.metric("Total Gain", f"{prog_df.iloc[-1]['Change']:+.2f} m/s")
-    
-    st.markdown("---")
-    
-    # Insight
-    if improved / total >= 0.75:
-        st.markdown('<div class="success-box">🌟 <b>Excellent Progression!</b> ' +
-                   f'{improved}/{total} sessions faster than baseline.</div>',
-                   unsafe_allow_html=True)
-    elif improved / total >= 0.5:
-        st.markdown('<div class="info-box">📈 <b>Positive Progress:</b> ' +
-                   f'{improved}/{total} sessions show improvement.</div>',
-                   unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="warning-box">⚠️ <b>Review Needed:</b> ' +
-                   f'Only {improved}/{total} sessions improved.</div>',
-                   unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Chart
-    fig = go.Figure()
-    
-    all_dates = [baseline] + list(prog_df['Date'])
-    all_speeds = [baseline_stats['max_speed']] + list(prog_df['Max Speed'])
-    colors = ['gray'] + ['green' if x else 'red' for x in prog_df['Improved']]
-    
-    fig.add_trace(go.Scatter(
-        x=all_dates, y=all_speeds,
-        mode='lines+markers',
-        line=dict(color='#3b82f6', width=3),
-        marker=dict(size=12, color=colors, line=dict(width=2, color='white')),
-        name='Max Speed'
-    ))
-    
-    # Trend
-    x_num = np.arange(len(all_dates))
-    z = np.polyfit(x_num, all_speeds, 1)
-    fig.add_trace(go.Scatter(
-        x=all_dates, y=np.poly1d(z)(x_num),
-        mode='lines', name='Trend',
-        line=dict(color='red', dash='dash', width=2)
-    ))
-    
-    fig.update_layout(
-        xaxis_title='Date', yaxis_title='Max Speed (m/s)',
-        height=400, template='plotly_white'
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("⭐ Gray = Baseline | 🟢 Green = Improved | 🔴 Red = Declined")
-    
-    # Table
-    st.subheader("Session Details")
-    display_prog = prog_df.copy()
-    display_prog['Date'] = display_prog['Date'].astype(str)
-    display_prog['Max Speed'] = display_prog['Max Speed'].apply(lambda x: f"{x:.2f}")
-    display_prog['Change'] = display_prog['Change'].apply(lambda x: f"{x:+.3f}")
-    display_prog['Change (%)'] = display_prog['Change (%)'].apply(lambda x: f"{x:+.1f}%")
-    display_prog['P-Value'] = display_prog['P-Value'].apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
-    display_prog['Status'] = display_prog['Improved'].apply(lambda x: "🟢" if x else "🔴")
-    
-    st.dataframe(display_prog[['Date', 'Days', 'Max Speed', 'Change', 'Change (%)', 'P-Value', 'Status']], 
-                 use_container_width=True)
-    
-    # Download
-    csv = prog_df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Data", csv, 
-                      f"{selected_athlete.replace(' ', '_')}_progression.csv", "text/csv")
-
-# ============================================================================
-# TAB 5: SOCCER ANALYTICS
-# ============================================================================
-
-with tab5:
     st.header("⚽ Soccer-Specific Performance Analytics")
     st.caption("Advanced metrics tailored for soccer performance and injury prevention")
     
@@ -1400,6 +1707,453 @@ with tab5:
                     st.markdown('</div>', unsafe_allow_html=True)
                 
                 st.caption("*Predictions based on linear regression of training data. Actual results may vary based on training load, recovery, and other factors.")
+
+# ============================================================================
+# TAB 5: LOAD-VELOCITY PROFILES
+# ============================================================================
+
+with tab5:
+    st.header("📊 Multi-Session Load-Velocity Profile Comparison")
+    
+    st.markdown("""
+    Compare Force-Velocity profiles across multiple training sessions to track neuromuscular adaptations.
+    **Key Metrics:**
+    - **V0**: Theoretical maximum velocity (speed capability)
+    - **F0**: Theoretical maximum force (strength capability)  
+    - **Pmax**: Maximum power output (F0 × V0 / 4)
+    """)
+    
+    # Athlete selection
+    selected_athlete_fv = st.selectbox("Select Athlete", athletes, key='fv_athlete')
+    
+    # Get sessions with F-V data
+    fv_sessions = get_sessions_with_fv_data(df, selected_athlete_fv, min_loads=2)
+    
+    if len(fv_sessions) == 0:
+        st.warning("⚠️ No sessions with multiple load conditions found for this athlete. Need at least 2 different loads per session for F-V profiling.")
+    else:
+        # Display available sessions
+        sessions_df = pd.DataFrame(fv_sessions)
+        st.markdown(f"**{len(fv_sessions)} sessions available** with load variation")
+        
+        # Session selector
+        session_dates = [s['date'] for s in fv_sessions]
+        selected_sessions = st.multiselect(
+            "Select Sessions to Compare (2-4 recommended)",
+            session_dates,
+            default=session_dates[:min(3, len(session_dates))],
+            format_func=lambda x: f"{x} ({[s['load_range'] for s in fv_sessions if s['date']==x][0]})",
+            key='fv_sessions'
+        )
+        
+        if len(selected_sessions) < 1:
+            st.info("👆 Select at least one session to view its F-V profile")
+        else:
+            # Calculate profiles for selected sessions
+            profiles = []
+            for date in selected_sessions:
+                profile = calculate_fv_profile(df, selected_athlete_fv, date)
+                if profile:
+                    profiles.append(profile)
+            
+            if len(profiles) == 0:
+                st.error("Could not calculate F-V profiles for selected sessions. Need more load variation.")
+            else:
+                # Visualization
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    st.subheader("Load-Velocity Overlay")
+                    
+                    fig = go.Figure()
+                    colors = px.colors.qualitative.Set2
+                    
+                    for i, profile in enumerate(profiles):
+                        color = colors[i % len(colors)]
+                        date_str = str(profile['date'])
+                        
+                        # Data points
+                        fig.add_trace(go.Scatter(
+                            x=profile['loads'],
+                            y=profile['velocities'],
+                            mode='markers',
+                            name=f"{date_str} (data)",
+                            marker=dict(size=12, color=color),
+                            showlegend=True
+                        ))
+                        
+                        # Regression line (extend to F0)
+                        x_line = np.linspace(0, max(profile['F0_load'], profile['loads'].max()), 50)
+                        y_line = profile['V0'] + profile['slope'] * x_line
+                        y_line = np.clip(y_line, 0, None)  # Can't have negative velocity
+                        
+                        fig.add_trace(go.Scatter(
+                            x=x_line,
+                            y=y_line,
+                            mode='lines',
+                            name=f"{date_str} (fit)",
+                            line=dict(color=color, dash='dash', width=2),
+                            showlegend=True
+                        ))
+                        
+                        # Mark V0 and F0
+                        fig.add_trace(go.Scatter(
+                            x=[0], y=[profile['V0']],
+                            mode='markers',
+                            marker=dict(size=10, symbol='diamond', color=color),
+                            name=f"V0: {profile['V0']:.2f}",
+                            showlegend=False
+                        ))
+                    
+                    fig.update_layout(
+                        xaxis_title='Load (kg)',
+                        yaxis_title='Velocity (m/s)',
+                        height=500,
+                        template='plotly_white',
+                        hovermode='closest',
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02)
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    st.subheader("Profile Metrics")
+                    
+                    for i, profile in enumerate(profiles):
+                        with st.expander(f"📅 {profile['date']}", expanded=i==0):
+                            st.metric("V0 (Max Velocity)", f"{profile['V0']:.2f} m/s")
+                            st.metric("F0 (Max Force)", f"{profile['F0_newtons']:.0f} N")
+                            st.metric("Pmax (Power)", f"{profile['Pmax']:.0f} W")
+                            st.metric("R² (Fit Quality)", f"{profile['r_squared']:.3f}")
+                            st.caption(f"Based on {profile['n_points']} load conditions")
+                
+                # Delta comparison (if multiple sessions)
+                if len(profiles) >= 2:
+                    st.markdown("---")
+                    st.subheader("📈 Changes Over Time")
+                    
+                    first = profiles[0]
+                    last = profiles[-1]
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        v0_change = ((last['V0'] - first['V0']) / first['V0']) * 100
+                        st.metric("V0 Change", f"{v0_change:+.1f}%", 
+                                 delta=f"{last['V0'] - first['V0']:+.2f} m/s")
+                    
+                    with col2:
+                        f0_change = ((last['F0_newtons'] - first['F0_newtons']) / first['F0_newtons']) * 100
+                        st.metric("F0 Change", f"{f0_change:+.1f}%",
+                                 delta=f"{last['F0_newtons'] - first['F0_newtons']:+.0f} N")
+                    
+                    with col3:
+                        pmax_change = ((last['Pmax'] - first['Pmax']) / first['Pmax']) * 100
+                        st.metric("Pmax Change", f"{pmax_change:+.1f}%",
+                                 delta=f"{last['Pmax'] - first['Pmax']:+.0f} W")
+                    
+                    with col4:
+                        # Profile shift interpretation
+                        if v0_change > 2 and f0_change > 2:
+                            shift = "↗️ Overall Improvement"
+                        elif v0_change > 2:
+                            shift = "🏃 Velocity Shift"
+                        elif f0_change > 2:
+                            shift = "💪 Force Shift"
+                        elif v0_change < -2 or f0_change < -2:
+                            shift = "⚠️ Declining"
+                        else:
+                            shift = "➡️ Stable"
+                        st.metric("Profile Shift", shift)
+                    
+                    # Interpretation
+                    st.markdown("---")
+                    if v0_change > 3:
+                        st.success("✅ **Velocity capability improved** - Sprint-specific adaptations occurring")
+                    if f0_change > 3:
+                        st.success("✅ **Force capability improved** - Strength gains transferring to sprinting")
+                    if pmax_change > 5:
+                        st.success("✅ **Power output increased** - Both force and velocity contributing")
+                    if v0_change < -3 or f0_change < -3:
+                        st.warning("⚠️ **Performance declining** - Consider recovery, deload, or program adjustment")
+
+# ============================================================================
+# TAB 6: ASYMMETRY ANALYSIS
+# ============================================================================
+
+with tab6:
+    st.header("⚖️ Left/Right Asymmetry Analysis")
+    
+    st.markdown("""
+    Analyze bilateral differences in sprint performance. Asymmetries >10% are associated with increased injury risk.
+    
+    **Asymmetry Index Formula:** `(Left - Right) / Average × 100`
+    - Positive = Left side dominant
+    - Negative = Right side dominant
+    """)
+    
+    # Check if Side data exists
+    if 'Side' not in df.columns or df['Side'].isna().all():
+        st.warning("⚠️ No Left/Right side data available in this dataset. Ensure your 1080 export includes the 'Side' column.")
+        st.info("To enable asymmetry analysis, run sprint tests with the 1080 configured to record Left and Right sides separately.")
+    else:
+        # Get athletes with L/R data
+        athletes_with_lr = []
+        for athlete in athletes:
+            athlete_data = df[(df['Client'] == athlete) & (df['Side'].isin(['Left', 'Right']))]
+            if athlete_data['Side'].nunique() >= 2:
+                athletes_with_lr.append(athlete)
+        
+        if len(athletes_with_lr) == 0:
+            st.warning("⚠️ No athletes have both Left and Right data. Need sprints recorded on both sides.")
+        else:
+            st.success(f"✅ {len(athletes_with_lr)} athletes have Left/Right data available")
+            
+            selected_athlete_asym = st.selectbox("Select Athlete", athletes_with_lr, key='asym_athlete')
+            
+            # Overall asymmetry analysis
+            st.markdown("---")
+            st.subheader("📊 Overall Asymmetry Summary")
+            
+            asym_detail = analyze_asymmetry_detailed(df, selected_athlete_asym)
+            
+            if asym_detail is None:
+                st.error("Could not calculate asymmetry for this athlete.")
+            else:
+                st.caption(f"Based on {asym_detail['left_count']} Left and {asym_detail['right_count']} Right sprints")
+                
+                # Metrics cards
+                cols = st.columns(len(asym_detail['metrics']))
+                
+                for i, (metric_key, metric_data) in enumerate(asym_detail['metrics'].items()):
+                    with cols[i]:
+                        st.markdown(f"**{metric_data['label']}**")
+                        
+                        # Color-coded asymmetry display
+                        asym_color = metric_data['color']
+                        st.markdown(f"""
+                        <div style="background-color: {asym_color}20; border-left: 4px solid {asym_color}; 
+                                    padding: 10px; border-radius: 5px; margin: 5px 0;">
+                            <span style="font-size: 24px; font-weight: bold; color: {asym_color};">
+                                {metric_data['abs_asymmetry']:.1f}%
+                            </span>
+                            <br>
+                            <span style="font-size: 12px;">Risk: {metric_data['risk']}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        st.caption(f"Left: {metric_data['left']:.2f} | Right: {metric_data['right']:.2f}")
+                        st.caption(f"Dominant: {metric_data['dominant']}")
+                
+                # Visual comparison
+                st.markdown("---")
+                st.subheader("🔄 Side-by-Side Comparison")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Speed comparison bar chart
+                    if 'TopSpeed' in asym_detail['metrics']:
+                        speed_data = asym_detail['metrics']['TopSpeed']
+                        
+                        fig = go.Figure(data=[
+                            go.Bar(
+                                x=['Left', 'Right'],
+                                y=[speed_data['left'], speed_data['right']],
+                                marker_color=['#3b82f6', '#ef4444'],
+                                text=[f"{speed_data['left']:.2f}", f"{speed_data['right']:.2f}"],
+                                textposition='outside'
+                            )
+                        ])
+                        
+                        fig.update_layout(
+                            title='Max Speed by Side',
+                            yaxis_title='Speed (m/s)',
+                            height=350,
+                            template='plotly_white',
+                            showlegend=False
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    # Acceleration comparison
+                    if 'MaxAcceleration' in asym_detail['metrics']:
+                        accel_data = asym_detail['metrics']['MaxAcceleration']
+                        
+                        fig = go.Figure(data=[
+                            go.Bar(
+                                x=['Left', 'Right'],
+                                y=[accel_data['left'], accel_data['right']],
+                                marker_color=['#3b82f6', '#ef4444'],
+                                text=[f"{accel_data['left']:.2f}", f"{accel_data['right']:.2f}"],
+                                textposition='outside'
+                            )
+                        ])
+                        
+                        fig.update_layout(
+                            title='Max Acceleration by Side',
+                            yaxis_title='Acceleration (m/s²)',
+                            height=350,
+                            template='plotly_white',
+                            showlegend=False
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                # Load-matched asymmetry
+                st.markdown("---")
+                st.subheader("🎯 Load-Matched Asymmetry")
+                
+                load_matched = get_load_matched_asymmetry(df, selected_athlete_asym)
+                
+                if load_matched is None or len(load_matched) == 0:
+                    st.info("ℹ️ No matching loads found between Left and Right sides. Need identical load conditions on both sides.")
+                else:
+                    st.markdown("Comparing Left vs Right at the same resistance levels:")
+                    
+                    # Add risk classification
+                    def classify_risk(val):
+                        if val < 5:
+                            return '🟢 Low'
+                        elif val < 10:
+                            return '🟡 Moderate'
+                        else:
+                            return '🔴 High'
+                    
+                    load_matched['Risk'] = load_matched['abs_asymmetry'].apply(classify_risk)
+                    
+                    display_cols = ['load', 'left_speed', 'right_speed', 'asymmetry', 'Risk']
+                    display_df = load_matched[display_cols].copy()
+                    display_df.columns = ['Load (kg)', 'Left Speed', 'Right Speed', 'Asymmetry %', 'Risk']
+                    display_df['Left Speed'] = display_df['Left Speed'].round(2)
+                    display_df['Right Speed'] = display_df['Right Speed'].round(2)
+                    display_df['Asymmetry %'] = display_df['Asymmetry %'].round(1)
+                    
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                    # Asymmetry by load chart
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Bar(
+                        x=load_matched['load'],
+                        y=load_matched['asymmetry'],
+                        marker_color=[
+                            '#10b981' if abs(a) < 5 else '#f59e0b' if abs(a) < 10 else '#ef4444'
+                            for a in load_matched['asymmetry']
+                        ],
+                        text=[f"{a:.1f}%" for a in load_matched['asymmetry']],
+                        textposition='outside'
+                    ))
+                    
+                    # Add threshold lines
+                    fig.add_hline(y=5, line_dash="dash", line_color="#f59e0b", 
+                                 annotation_text="5% threshold")
+                    fig.add_hline(y=-5, line_dash="dash", line_color="#f59e0b")
+                    fig.add_hline(y=10, line_dash="dash", line_color="#ef4444",
+                                 annotation_text="10% threshold")
+                    fig.add_hline(y=-10, line_dash="dash", line_color="#ef4444")
+                    
+                    fig.update_layout(
+                        title='Asymmetry by Load',
+                        xaxis_title='Load (kg)',
+                        yaxis_title='Asymmetry % (+ = Left dominant)',
+                        height=400,
+                        template='plotly_white'
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                # Asymmetry trend over time
+                st.markdown("---")
+                st.subheader("📈 Asymmetry Trend Over Time")
+                
+                trend = get_asymmetry_trend(df, selected_athlete_asym)
+                
+                if trend is None or len(trend) < 2:
+                    st.info("ℹ️ Need at least 2 sessions with Left/Right data to show trend.")
+                else:
+                    fig = go.Figure()
+                    
+                    fig.add_trace(go.Scatter(
+                        x=trend['date'],
+                        y=trend['speed_asymmetry'],
+                        mode='lines+markers',
+                        name='Speed Asymmetry',
+                        line=dict(color='#3b82f6', width=3),
+                        marker=dict(size=10)
+                    ))
+                    
+                    if 'accel_asymmetry' in trend.columns:
+                        fig.add_trace(go.Scatter(
+                            x=trend['date'],
+                            y=trend['accel_asymmetry'],
+                            mode='lines+markers',
+                            name='Acceleration Asymmetry',
+                            line=dict(color='#10b981', width=3),
+                            marker=dict(size=10)
+                        ))
+                    
+                    # Threshold zones
+                    fig.add_hrect(y0=0, y1=5, fillcolor="#10b981", opacity=0.1, 
+                                 annotation_text="Low Risk", annotation_position="right")
+                    fig.add_hrect(y0=5, y1=10, fillcolor="#f59e0b", opacity=0.1,
+                                 annotation_text="Moderate", annotation_position="right")
+                    fig.add_hrect(y0=10, y1=trend['speed_asymmetry'].max() + 5, 
+                                 fillcolor="#ef4444", opacity=0.1,
+                                 annotation_text="High Risk", annotation_position="right")
+                    
+                    fig.update_layout(
+                        xaxis_title='Date',
+                        yaxis_title='Asymmetry %',
+                        height=400,
+                        template='plotly_white',
+                        hovermode='x unified'
+                    )
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Trend interpretation
+                    if len(trend) >= 3:
+                        first_val = trend['speed_asymmetry'].iloc[0]
+                        last_val = trend['speed_asymmetry'].iloc[-1]
+                        change = last_val - first_val
+                        
+                        if change < -2:
+                            st.success(f"✅ **Asymmetry improving** - Decreased by {abs(change):.1f}% since first session")
+                        elif change > 2:
+                            st.warning(f"⚠️ **Asymmetry worsening** - Increased by {change:.1f}% since first session")
+                        else:
+                            st.info(f"➡️ **Asymmetry stable** - Change of {change:+.1f}%")
+                
+                # Recommendations
+                st.markdown("---")
+                st.subheader("📋 Recommendations")
+                
+                max_asym = max([m['abs_asymmetry'] for m in asym_detail['metrics'].values()])
+                
+                if max_asym > 10:
+                    st.markdown('<div class="warning-box">', unsafe_allow_html=True)
+                    st.markdown("**⚠️ High Asymmetry Detected - Action Required:**")
+                    st.markdown("- Prioritize unilateral strength training (single-leg exercises)")
+                    st.markdown("- Include single-leg plyometrics in warm-up")
+                    st.markdown("- Consider physiotherapy evaluation")
+                    st.markdown("- Monitor weekly until below 10%")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                elif max_asym > 5:
+                    st.markdown('<div class="info-box">', unsafe_allow_html=True)
+                    st.markdown("**⚡ Moderate Asymmetry - Monitor:**")
+                    st.markdown("- Include unilateral exercises 2x per week")
+                    st.markdown("- Address any movement pattern issues")
+                    st.markdown("- Re-test in 2-3 weeks")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                else:
+                    st.markdown('<div class="success-box">', unsafe_allow_html=True)
+                    st.markdown("**✅ Low Asymmetry - Good Balance:**")
+                    st.markdown("- Continue current training program")
+                    st.markdown("- Maintain bilateral strength work")
+                    st.markdown("- Re-test monthly to monitor")
+                    st.markdown('</div>', unsafe_allow_html=True)
 
 # Footer
 st.markdown("---")
