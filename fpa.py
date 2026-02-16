@@ -296,9 +296,11 @@ def load_and_clean_data(uploaded_file):
             if 'LIMB' not in existing_columns:
                 df['LIMB'] = 'Trial'
         
-        # Filter for Trial limb only (bilateral measurements) - avoid copy if already filtered
-        if 'LIMB' in df.columns and not df['LIMB'].eq('Trial').all():
-            df = df[df['LIMB'] == 'Trial']
+        # Normalize limb labels but do not hard-filter to Trial:
+        # some exports keep most metrics under Left/Right/Asymmetry labels.
+        if 'LIMB' in df.columns:
+            df['LIMB'] = df['LIMB'].fillna('Trial').astype(str).str.strip()
+            df.loc[df['LIMB'] == '', 'LIMB'] = 'Trial'
         
         # Convert dates and add temporal columns in one operation
         if 'TEST_DATE' in df.columns:
@@ -443,11 +445,19 @@ def analyze_metrics(df):
         'propulsive': metrics_df.loc[metric_upper.str.contains('PROPULSIVE', na=False), 'metric'].tolist(),
     }
     
-    # Get ALL available metrics (filter out low quality ones)
-    all_available_metrics = metrics_df[
-        (metrics_df['completeness_pct'] >= 50) &  # Lowered from 70 to include more
-        (metrics_df['num_athletes'] >= 2)  # At least 2 athletes
+    # Start with stricter quality thresholds; relax automatically if too few survive.
+    strict_metrics = metrics_df[
+        (metrics_df['completeness_pct'] >= 50) &
+        (metrics_df['num_athletes'] >= 2)
     ]['metric'].tolist()
+
+    if len(strict_metrics) >= 5:
+        all_available_metrics = strict_metrics
+    else:
+        all_available_metrics = metrics_df[
+            (metrics_df['num_datapoints'] >= 1) &
+            (metrics_df['num_athletes'] >= 1)
+        ]['metric'].tolist()
     
     return metrics_df, all_available_metrics, categories
 
