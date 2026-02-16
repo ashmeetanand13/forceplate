@@ -11,12 +11,14 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 from datetime import datetime
 import io
+from scipy import stats
 
 warnings.filterwarnings('ignore')
 
@@ -65,8 +67,20 @@ def detect_csv_format(df):
     # Wide format typically has many columns with units in brackets
     columns_with_brackets = sum(1 for col in df.columns if '[' in col and ']' in col)
     
-    # Wide format decision
-    if columns_with_brackets > 5 or 'Name' in df.columns:
+    # Check for common wide format column names (from various force plate systems)
+    wide_format_id_columns = {'Name', 'TestId', 'Date', 'Time', 'Segment', 'Position', 
+                              'Type', 'Excluded', 'Tags', 'System Weight', 'ExternalId'}
+    wide_format_match = len(wide_format_id_columns & set(df.columns))
+    
+    # Check for force plate metric column names (without brackets)
+    force_plate_metrics = {'Jump Height', 'Braking RFD', 'Stiffness', 'Peak Braking Force',
+                          'Peak Propulsive Force', 'Flight Time', 'Takeoff Velocity',
+                          'Peak Velocity', 'RSI', 'mRSI', 'Countermovement Depth',
+                          'Jump Momentum', 'Braking Phase', 'Propulsive Phase'}
+    metric_match = len(force_plate_metrics & set(df.columns))
+    
+    # Wide format decision - more flexible detection
+    if columns_with_brackets > 5 or 'Name' in df.columns or wide_format_match >= 3 or metric_match >= 3:
         return 'wide'
     
     # Fallback: check numeric columns ratio
@@ -83,14 +97,24 @@ def standardize_column_names(df, format_type):
     """
     if format_type == 'wide':
         # Rename common columns for wide format
+        # Supports multiple naming conventions from different force plate systems
         column_mapping = {
+            # Standard naming
             'Name': 'ATHLETE_NAME',
             'ExternalId': 'ATHLETE_ID',
             'Test Type': 'TEST_TYPE',
             'Date': 'TEST_DATE',
             'Time': 'TEST_TIME',
             'BW [KG]': 'BODY_WEIGHT_KG',
-            'Additional Load [kg]': 'ADDITIONAL_LOAD_KG'
+            'Additional Load [kg]': 'ADDITIONAL_LOAD_KG',
+            # Alternative naming (e.g., from Hawkin Dynamics, ForceDecks, etc.)
+            'TestId': 'TEST_ID',
+            'Segment': 'SEGMENT',
+            'Position': 'POSITION',
+            'Type': 'TEST_TYPE',
+            'Excluded': 'EXCLUDED',
+            'Tags': 'TAGS',
+            'System Weight': 'BODY_WEIGHT_KG',
         }
         # Only rename columns that actually exist to avoid unnecessary operations
         existing_mappings = {k: v for k, v in column_mapping.items() if k in df.columns}
@@ -124,16 +148,29 @@ def convert_wide_to_long(df_wide):
     # Standardize column names first
     df_wide = standardize_column_names(df_wide, 'wide')
     
-    # Common ID columns in wide format
+    # Common ID columns in wide format (supports multiple naming conventions)
     potential_id_cols = {'ATHLETE_NAME', 'ATHLETE_ID', 'TEST_TYPE', 'TEST_DATE', 
                         'TEST_TIME', 'BODY_WEIGHT_KG', 'ADDITIONAL_LOAD_KG',
-                        'Reps', 'Tags'}
+                        'Reps', 'Tags', 'TAGS',
+                        # Additional ID columns from various force plate systems
+                        'TEST_ID', 'SEGMENT', 'POSITION', 'EXCLUDED',
+                        'TestId', 'Date', 'Time', 'Name', 'Segment', 'Position', 
+                        'Type', 'Excluded', 'System Weight'}
     
-    # Keywords that indicate metric columns (converted to set for O(1) lookup)
-    metric_keywords = {'force', 'power', 'velocity', 'time', 'height', 'impulse', 
-                      'rfd', 'depth', 'duration', 'peak', 'mean', 'concentric', 
-                      'eccentric', 'jump', 'rsi', 'takeoff', 'landing', 'contraction',
-                      'flight', 'braking', 'countermovement'}
+    # Keywords that indicate metric columns (expanded for comprehensive coverage)
+    metric_keywords = {
+        # Movement phases & mechanics
+        'force', 'power', 'velocity', 'time', 'height', 'impulse', 
+        'rfd', 'depth', 'duration', 'peak', 'mean', 'avg', 'average',
+        'concentric', 'eccentric', 'jump', 'rsi', 'takeoff', 'landing', 
+        'contraction', 'flight', 'braking', 'countermovement', 'propulsive',
+        # Additional metrics from force plate systems
+        'stiffness', 'displacement', 'relative', 'momentum', 'unweighting',
+        'phase', 'net', 'positive', 'ratio', 'index', 'stabilization',
+        'performance', 'left', 'right', 'l|r', 'asymmetry', 'asym',
+        # mRSI and modified metrics
+        'mrsi', 'modified'
+    }
     
     # Separate ID and metric columns
     id_columns = list(potential_id_cols & set(df_wide.columns))
@@ -144,11 +181,12 @@ def convert_wide_to_long(df_wide):
             continue
             
         # Check if it's likely a metric column
-        if '[' in col or '/' in col or '%' in col:
+        # Method 1: Has brackets (units) or special characters
+        if '[' in col or '/' in col or '%' in col or '|' in col:
             metric_columns.append(col)
         else:
             col_lower = col.lower()
-            # Use any() with generator for early termination
+            # Method 2: Contains metric keywords
             if any(keyword in col_lower for keyword in metric_keywords):
                 metric_columns.append(col)
     
@@ -353,6 +391,7 @@ def filter_data_by_jump(df, jump_type):
     # No filtering possible - return original
     return df
 
+@st.cache_data(ttl=3600)
 def analyze_metrics(df):
     """Analyze and categorize available metrics - returns ALL metrics with stats"""
     all_metrics = df['TARGET_VARIABLE'].unique()
@@ -385,15 +424,23 @@ def analyze_metrics(df):
     # Categorize metrics using vectorized string operations
     metric_upper = metrics_df['metric'].str.upper()
     
-    # Create category dictionary
+    # Create category dictionary - expanded for comprehensive force plate metrics
     categories = {
         'power': metrics_df.loc[metric_upper.str.contains('POWER', na=False), 'metric'].tolist(),
         'force': metrics_df.loc[metric_upper.str.contains('FORCE', na=False) & 
                                 ~metric_upper.str.contains('RFD', na=False), 'metric'].tolist(),
-        'velocity': metrics_df.loc[metric_upper.str.contains('VELOCITY', na=False), 'metric'].tolist(),
-        'jump': metrics_df.loc[metric_upper.str.contains('JUMP|HEIGHT|RSI', regex=True, na=False), 'metric'].tolist(),
-        'timing': metrics_df.loc[metric_upper.str.contains('TIME|DURATION', regex=True, na=False), 'metric'].tolist(),
-        'rfd': metrics_df.loc[metric_upper.str.contains('RFD', na=False), 'metric'].tolist()
+        'velocity': metrics_df.loc[metric_upper.str.contains('VELOCITY|TAKEOFF', regex=True, na=False), 'metric'].tolist(),
+        'jump': metrics_df.loc[metric_upper.str.contains('JUMP|HEIGHT|RSI|MRSI|MOMENTUM', regex=True, na=False), 'metric'].tolist(),
+        'timing': metrics_df.loc[metric_upper.str.contains('TIME|DURATION|PHASE', regex=True, na=False), 'metric'].tolist(),
+        'rfd': metrics_df.loc[metric_upper.str.contains('RFD', na=False), 'metric'].tolist(),
+        # New categories for expanded metrics
+        'impulse': metrics_df.loc[metric_upper.str.contains('IMPULSE', na=False), 'metric'].tolist(),
+        'stiffness': metrics_df.loc[metric_upper.str.contains('STIFFNESS|DISPLACEMENT|DEPTH', regex=True, na=False), 'metric'].tolist(),
+        'landing': metrics_df.loc[metric_upper.str.contains('LANDING|STABILIZATION', regex=True, na=False), 'metric'].tolist(),
+        'asymmetry': metrics_df.loc[metric_upper.str.contains('L\\|R|LEFT|RIGHT|ASYM|INDEX', regex=True, na=False), 'metric'].tolist(),
+        'braking': metrics_df.loc[metric_upper.str.contains('BRAKING', na=False) & 
+                                  ~metric_upper.str.contains('RFD', na=False), 'metric'].tolist(),
+        'propulsive': metrics_df.loc[metric_upper.str.contains('PROPULSIVE', na=False), 'metric'].tolist(),
     }
     
     # Get ALL available metrics (filter out low quality ones)
@@ -404,8 +451,122 @@ def analyze_metrics(df):
     
     return metrics_df, all_available_metrics, categories
 
+@st.cache_data(ttl=3600)
+def compute_kmo_bartlett(correlation_matrix, n_samples):
+    """
+    KMO (Kaiser-Meyer-Olkin) and Bartlett's test - validates whether PCA is appropriate.
+    KMO > 0.6 = acceptable, > 0.8 = meritorious. Bartlett p < 0.05 = correlations exist.
+    Reference: Kaiser 1970, used in Merrigan et al. 2022 for CMJ force-time PCA.
+    """
+    try:
+        n_vars = correlation_matrix.shape[0]
+        inv_corr = np.linalg.pinv(correlation_matrix)
+        diag_inv = np.diag(1.0 / np.sqrt(np.diag(inv_corr) + 1e-10))
+        partial_corr = -1.0 * (diag_inv @ inv_corr @ diag_inv)
+        np.fill_diagonal(partial_corr, 1.0)
+        corr_sq_sum = np.sum(correlation_matrix ** 2) - n_vars
+        partial_sq_sum = np.sum(partial_corr ** 2) - n_vars
+        kmo_overall = corr_sq_sum / (corr_sq_sum + partial_sq_sum + 1e-10)
+        det = max(np.linalg.det(correlation_matrix), 1e-300)
+        chi_sq = -((n_samples - 1) - (2 * n_vars + 5) / 6) * np.log(det)
+        dof = n_vars * (n_vars - 1) / 2
+        p_value = 1 - stats.chi2.cdf(chi_sq, dof)
+        return {'kmo': round(kmo_overall, 3), 'bartlett_chi2': round(chi_sq, 1), 'bartlett_p': p_value, 'bartlett_dof': int(dof)}
+    except Exception:
+        return {'kmo': None, 'bartlett_chi2': None, 'bartlett_p': None, 'bartlett_dof': None}
+
+def parallel_analysis_threshold(n_samples, n_features, n_iter=100, percentile=95):
+    """
+    Horn's Parallel Analysis: compares real eigenvalues against random data eigenvalues.
+    More robust than Kaiser criterion per Goretzko et al. 2021.
+    Returns threshold eigenvalues from random data.
+    """
+    random_eigs = np.zeros((n_iter, n_features))
+    for i in range(n_iter):
+        rand = np.random.normal(size=(n_samples, n_features))
+        rand_corr = np.corrcoef(rand, rowvar=False)
+        random_eigs[i] = sorted(np.linalg.eigvalsh(rand_corr), reverse=True)
+    return np.percentile(random_eigs, percentile, axis=0)
+
+def create_correlation_heatmap(athlete_metrics_df, max_metrics=30):
+    """
+    Correlation matrix heatmap - MUST be checked before PCA.
+    PCA exploits correlations; if metrics are uncorrelated, PCA adds no value.
+    Per Merrigan et al. 2022, CMJ metrics are often r > 0.85 correlated,
+    making PCA ideal for dimension reduction.
+    """
+    if len(athlete_metrics_df.columns) > max_metrics:
+        variances = athlete_metrics_df.var().sort_values(ascending=False)
+        subset = athlete_metrics_df[variances.head(max_metrics).index.tolist()]
+    else:
+        subset = athlete_metrics_df
+    corr = subset.corr()
+    display_names = [m[:25] for m in corr.columns]
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values, x=display_names, y=display_names,
+        colorscale='RdBu_r', zmid=0, zmin=-1, zmax=1,
+        colorbar=dict(title="r"),
+        hovertemplate='%{x}<br>%{y}<br>r = %{z:.2f}<extra></extra>'
+    ))
+    fig.update_layout(
+        title="Metric Correlation Matrix (verifies PCA suitability)",
+        height=600 + len(display_names) * 5,
+        xaxis={'tickangle': 45}, yaxis={'autorange': 'reversed'}
+    )
+    return fig, corr
+
+def create_biplot(pca_model, pca_data, feature_names, athlete_names, cluster_labels=None, top_n=10):
+    """
+    PCA Biplot: scores (athletes as dots) + loadings (metrics as arrows) on same plot.
+    Arrow direction = which PC the metric loads onto.
+    Arrow length = strength of contribution.
+    Angle between arrows = correlation (small = correlated, 90° = uncorrelated).
+    This is the gold-standard PCA visualization in sports science papers
+    (Merrigan et al. 2022, Keogh et al. 2024, Bird et al. 2022).
+    """
+    fig = go.Figure()
+    loadings = pca_model.components_[:2].T
+    score_scale = max(np.abs(pca_data[:, :2]).max(), 1e-10)
+    loading_scale = max(np.abs(loadings).max(), 1e-10)
+    scores_s = pca_data[:, :2] / score_scale
+    loadings_s = loadings / loading_scale
+    colors = px.colors.qualitative.Set1
+    if cluster_labels is not None:
+        for cl in np.unique(cluster_labels):
+            mask = cluster_labels == cl
+            fig.add_trace(go.Scatter(
+                x=scores_s[mask, 0], y=scores_s[mask, 1],
+                mode='markers+text',
+                text=[athlete_names[i][:12] for i in range(len(athlete_names)) if mask[i]],
+                textposition="top center", name=f'Cluster {cl+1}',
+                marker=dict(size=14, color=colors[cl % len(colors)], line=dict(width=1, color='black'))
+            ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=scores_s[:, 0], y=scores_s[:, 1], mode='markers+text',
+            text=[n[:12] for n in athlete_names], textposition="top center",
+            name='Athletes', marker=dict(size=14, color='steelblue')
+        ))
+    mag = np.sqrt(loadings_s[:, 0]**2 + loadings_s[:, 1]**2)
+    top_idx = np.argsort(mag)[-top_n:]
+    for idx in top_idx:
+        fig.add_annotation(ax=0, ay=0, axref="x", ayref="y",
+            x=loadings_s[idx, 0], y=loadings_s[idx, 1],
+            showarrow=True, arrowhead=2, arrowsize=1.5, arrowwidth=2, arrowcolor='red', opacity=0.7)
+        fig.add_annotation(x=loadings_s[idx, 0]*1.12, y=loadings_s[idx, 1]*1.12,
+            text=feature_names[idx][:20], showarrow=False, font=dict(size=9, color='red'))
+    v1, v2 = pca_model.explained_variance_ratio_[0], pca_model.explained_variance_ratio_[1]
+    fig.update_layout(title="PCA Biplot (Athletes + Metric Loadings)",
+        xaxis_title=f"PC1 ({v1:.1%})", yaxis_title=f"PC2 ({v2:.1%})",
+        height=600, showlegend=True, plot_bgcolor='rgba(248,248,248,1)')
+    theta = np.linspace(0, 2*np.pi, 100)
+    fig.add_trace(go.Scatter(x=np.cos(theta), y=np.sin(theta), mode='lines',
+        line=dict(dash='dot', color='gray', width=1), showlegend=False, hoverinfo='skip'))
+    return fig
+
+@st.cache_data(ttl=3600)
 def perform_pca_analysis(df, selected_metrics, selected_athletes):
-    """Perform PCA analysis on selected data"""
+    """Perform PCA analysis with diagnostics (KMO, Bartlett, Kaiser, parallel analysis)"""
     # Filter data
     df_filtered = df[df['ATHLETE_NAME'].isin(selected_athletes)]
     
@@ -417,26 +578,66 @@ def perform_pca_analysis(df, selected_metrics, selected_athletes):
         aggfunc='mean'
     )
     
-    # Fill missing values
+    # Drop all-NaN columns, fill remaining with median (more robust than mean for skewed data)
+    athlete_metrics = athlete_metrics.dropna(axis=1, how='all')
     athlete_metrics_filled = athlete_metrics.fillna(athlete_metrics.median())
     
-    # Standardize
+    # Drop zero-variance columns (can't standardize, no information)
+    zero_var = athlete_metrics_filled.columns[athlete_metrics_filled.std() == 0]
+    if len(zero_var) > 0:
+        athlete_metrics_filled = athlete_metrics_filled.drop(columns=zero_var)
+    
+    # Standardize (z-score) - required when metrics have different units
     scaler = StandardScaler()
     scaled_data = scaler.fit_transform(athlete_metrics_filled)
     
-    # PCA
-    pca = PCA()
+    # Compute correlation matrix for diagnostics
+    corr_matrix = np.corrcoef(scaled_data, rowvar=False)
+    diagnostics = compute_kmo_bartlett(corr_matrix, len(athlete_metrics_filled))
+    
+    # Full PCA to get all eigenvalues for scree plot
+    pca_full = PCA()
+    pca_full.fit(scaled_data)
+    eigenvalues = pca_full.explained_variance_
+    
+    # Kaiser criterion: keep components with eigenvalue > 1
+    n_kaiser = max(1, int(np.sum(eigenvalues > 1.0)))
+    
+    # Parallel analysis (more robust than Kaiser per Goretzko et al. 2021)
+    n_samples, n_features = scaled_data.shape
+    try:
+        pa_thresh = parallel_analysis_threshold(n_samples, n_features)
+        n_parallel = max(1, int(np.sum(eigenvalues > pa_thresh)))
+    except Exception:
+        n_parallel = n_kaiser
+    
+    # Use more conservative estimate, minimum 2 for visualization
+    n_components = max(2, min(n_kaiser, n_parallel, n_features, n_samples))
+    
+    # Refit with selected n_components
+    pca = PCA(n_components=n_components)
     pca_data = pca.fit_transform(scaled_data)
     
-    # Feature importance
-    feature_importance = np.abs(pca.components_[:3]).mean(axis=0)
+    # FIXED: Feature importance weighted by explained variance ratio
+    # Original bug: np.abs(pca.components_[:3]).mean(axis=0) equally weighted all 3 PCs
+    # Fix: weight by variance explained so PC1 (e.g., 40%) matters more than PC3 (e.g., 8%)
+    weights = pca.explained_variance_ratio_
+    feature_importance = (np.abs(pca.components_) * weights[:, np.newaxis]).sum(axis=0)
     
     return {
         'athlete_metrics': athlete_metrics_filled,
         'pca_data': pca_data,
         'pca_model': pca,
+        'pca_full': pca_full,
         'feature_importance': feature_importance,
-        'feature_names': list(athlete_metrics_filled.columns)
+        'feature_names': list(athlete_metrics_filled.columns),
+        'scaled_data': scaled_data,
+        'scaler': scaler,
+        'correlation_matrix': corr_matrix,
+        'diagnostics': diagnostics,
+        'n_kaiser': n_kaiser,
+        'n_parallel': n_parallel,
+        'eigenvalues': eigenvalues
     }
 
 def create_visualizations(pca_results, num_clusters=3):
@@ -503,9 +704,19 @@ def create_visualizations(pca_results, num_clusters=3):
         row=2, col=1
     )
     
-    # 3. K-means Clustering - CLUSTER COLORS
-    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(pca_data[:, :3])
+    # 3. K-means Clustering - FIXED: cluster on PCA-reduced space
+    # Original bug: inconsistently clustered on pca_data[:,:3] here but scaled_data in enhanced PCA
+    n_dims = min(3, pca_data.shape[1])
+    cluster_input = pca_data[:, :n_dims]
+    
+    actual_clusters = min(num_clusters, len(athlete_names))
+    kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=10)
+    clusters = kmeans.fit_predict(cluster_input)
+    
+    # Silhouette score: validates cluster quality (-1 to 1, higher = better separated)
+    sil_score = None
+    if actual_clusters >= 2 and len(athlete_names) > actual_clusters:
+        sil_score = silhouette_score(cluster_input, clusters)
 
     cluster_colors = px.colors.qualitative.Set1
     
@@ -551,8 +762,9 @@ def create_visualizations(pca_results, num_clusters=3):
             row=3, col=1
         )
     
-    # 4. Explained Variance
-    explained_var = pca_results['pca_model'].explained_variance_ratio_[:10]
+    # 4. Explained Variance - use full PCA for complete scree plot
+    pca_for_scree = pca_results.get('pca_full', pca_results['pca_model'])
+    explained_var = pca_for_scree.explained_variance_ratio_[:10]
     cumulative_var = np.cumsum(explained_var)
     
     fig.add_trace(
@@ -656,7 +868,7 @@ def create_visualizations(pca_results, num_clusters=3):
     fig.update_xaxes(title_text="<b>Component Number</b>", row=4, col=1, title_font_size=14)
     fig.update_yaxes(title_text="<b>Variance Explained</b>", row=4, col=1, title_font_size=14)
     
-    return fig, clusters
+    return fig, clusters, sil_score
 
 def get_metrics_by_pattern(patterns, available_metrics):
     """Get metrics that match any of the given patterns"""
@@ -666,6 +878,35 @@ def get_metrics_by_pattern(patterns, available_metrics):
         if any(pattern.upper() in metric_upper for pattern in patterns):
             matching.append(metric)
     return matching
+
+def search_and_filter_metrics(all_metrics, search_term="", quick_filter="All"):
+    """Search and filter metrics with quick presets"""
+    # Quick filter presets
+    quick_filters = {
+        "All": [],
+        "Power & Force": ["POWER", "FORCE"],
+        "Speed & Velocity": ["VELOCITY", "SPEED", "TAKEOFF"],
+        "Jump Performance": ["JUMP", "HEIGHT", "RSI", "FLIGHT"],
+        "Timing": ["TIME", "DURATION", "PHASE"],
+        "RFD": ["RFD", "RPD"],
+        "Asymmetry": ["ASYM", "L|R", "LEFT", "RIGHT"]
+    }
+
+    filtered_metrics = all_metrics
+
+    # Apply quick filter
+    if quick_filter != "All" and quick_filter in quick_filters:
+        patterns = quick_filters[quick_filter]
+        filtered_metrics = get_metrics_by_pattern(patterns, filtered_metrics)
+
+    # Apply search term
+    if search_term:
+        filtered_metrics = [
+            m for m in filtered_metrics
+            if search_term.upper() in m.upper()
+        ]
+
+    return filtered_metrics
 
 def perform_enhanced_pca_analysis(df, enhanced_metrics, selected_athletes, n_clusters):
     """Perform robust enhanced PCA analysis with proper error handling"""
@@ -753,10 +994,16 @@ def perform_enhanced_pca_analysis(df, enhanced_metrics, selected_athletes, n_clu
         pca = PCA(n_components=n_components)
         pca_data = pca.fit_transform(scaled_data)
         
-        # Perform clustering
+        # FIXED: Cluster on PCA-reduced space, not raw scaled_data
+        # Original bug: clustering in full feature space but visualizing in PCA space = misleading
         actual_clusters = min(n_clusters, len(athlete_matrix))
         kmeans = KMeans(n_clusters=actual_clusters, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(scaled_data)
+        cluster_labels = kmeans.fit_predict(pca_data)
+        
+        # Silhouette score for cluster quality validation
+        sil_score = None
+        if actual_clusters >= 2 and len(athlete_names) > actual_clusters:
+            sil_score = silhouette_score(pca_data, cluster_labels)
         
         return {
             'athlete_array': athlete_array,
@@ -768,79 +1015,109 @@ def perform_enhanced_pca_analysis(df, enhanced_metrics, selected_athletes, n_clu
             'valid_metrics': valid_metrics,
             'n_components': n_components,
             'n_clusters': actual_clusters,
-            'scaler': scaler
+            'scaler': scaler,
+            'silhouette_score': sil_score
         }, None
         
     except Exception as e:
         return None, f"Error in PCA analysis: {str(e)}"
 
 def analyze_trends(df, selected_athletes, selected_metrics):
-    """Analyze performance trends over time"""
+    """Analyze performance trends over time with statistical significance"""
     df_trends = df[
-        (df['ATHLETE_NAME'].isin(selected_athletes)) & 
+        (df['ATHLETE_NAME'].isin(selected_athletes)) &
         (df['TARGET_VARIABLE'].isin(selected_metrics))
     ].copy()
-    
+
     # Create proper date column for better plotting
     df_trends['DATE'] = pd.to_datetime(df_trends['TEST_DATE'])
-    
+
     # Group by actual date (not period) for better plotting
     df_trends = df_trends.groupby(['ATHLETE_NAME', 'DATE', 'TARGET_VARIABLE'])['RESULT'].mean().reset_index()
     df_trends = df_trends.sort_values('DATE')
-    
-    # Calculate improvement rates
+
+    # Calculate improvement rates with statistical significance
     improvement_data = []
     for athlete in selected_athletes:
         for metric in selected_metrics:
             athlete_metric = df_trends[
-                (df_trends['ATHLETE_NAME'] == athlete) & 
+                (df_trends['ATHLETE_NAME'] == athlete) &
                 (df_trends['TARGET_VARIABLE'] == metric)
             ].sort_values('DATE')
-            
+
             if len(athlete_metric) >= 2:
                 first_val = athlete_metric['RESULT'].iloc[0]
                 last_val = athlete_metric['RESULT'].iloc[-1]
-                
+
                 if first_val != 0:
                     improvement = ((last_val - first_val) / abs(first_val)) * 100
                 else:
                     improvement = 0
-                
+
+                # Statistical significance test (linear regression slope)
+                significance = 'N/A'
+                effect_size_d = 'N/A'
+                if len(athlete_metric) >= 3:
+                    x = np.arange(len(athlete_metric))
+                    y = athlete_metric['RESULT'].values
+                    try:
+                        _, _, _, p_value, _ = stats.linregress(x, y)
+                        if p_value < 0.001:
+                            significance = '***'
+                        elif p_value < 0.01:
+                            significance = '**'
+                        elif p_value < 0.05:
+                            significance = '*'
+                        else:
+                            significance = 'ns'
+                        
+                        # Cohen's d: split into halves, compare means
+                        mid = len(y) // 2
+                        first_half, second_half = y[:mid], y[mid:]
+                        if len(first_half) > 0 and len(second_half) > 0:
+                            pooled_sd = np.sqrt((np.var(first_half, ddof=1) + np.var(second_half, ddof=1)) / 2)
+                            if pooled_sd > 0:
+                                effect_size_d = f"{(np.mean(second_half) - np.mean(first_half)) / pooled_sd:.2f}"
+                    except:
+                        significance = 'N/A'
+
                 improvement_data.append({
                     'Athlete': athlete,
                     'Metric': metric,
                     'Improvement (%)': improvement,
                     'First Value': first_val,
                     'Last Value': last_val,
-                    'Data Points': len(athlete_metric)
+                    'Data Points': len(athlete_metric),
+                    'Significance': significance,
+                    'Effect Size (d)': effect_size_d
                 })
-    
+
     improvement_df = pd.DataFrame(improvement_data)
-    
+
     # Create trend figure with 2 columns and up to 10 metrics
     num_metrics = min(10, len(selected_metrics))
     num_rows = (num_metrics + 1) // 2
-    
+
     fig_trends = make_subplots(
-        rows=num_rows, 
+        rows=num_rows,
         cols=2,
         subplot_titles=[f"{metric[:40]}..." if len(metric) > 40 else metric for metric in selected_metrics[:num_metrics]],
         vertical_spacing=0.08,
         horizontal_spacing=0.12
     )
-    
+
     colors = px.colors.qualitative.Set1
-    
+
     for i, metric in enumerate(selected_metrics[:num_metrics]):
         row = (i // 2) + 1
         col = (i % 2) + 1
-        
+
         for j, athlete in enumerate(selected_athletes):
             athlete_data = df_trends[
-                (df_trends['ATHLETE_NAME'] == athlete) & 
+                (df_trends['ATHLETE_NAME'] == athlete) &
                 (df_trends['TARGET_VARIABLE'] == metric)
             ].sort_values('DATE')
-            
+
             if len(athlete_data) > 0:
                 fig_trends.add_trace(
                     go.Scatter(
@@ -859,7 +1136,7 @@ def analyze_trends(df, selected_athletes, selected_metrics):
                     ),
                     row=row, col=col
                 )
-    
+
     # Update all x-axes and y-axes
     for i in range(1, num_rows + 1):
         for j in range(1, 3):
@@ -881,9 +1158,9 @@ def analyze_trends(df, selected_athletes, selected_metrics):
                 gridcolor='rgba(128,128,128,0.2)',
                 title_font=dict(size=12)
             )
-    
+
     chart_height = 400 * num_rows
-    
+
     fig_trends.update_layout(
         height=chart_height,
         title_text="<b>Performance Trends Over Time</b>",
@@ -901,8 +1178,266 @@ def analyze_trends(df, selected_athletes, selected_metrics):
         paper_bgcolor='rgba(0,0,0,0)',
         font=dict(size=11)
     )
-    
+
     return fig_trends, improvement_df
+
+@st.cache_data(ttl=3600)
+def create_data_quality_dashboard(df, selected_athletes, all_metrics):
+    """Create comprehensive data quality visualization"""
+    # Build completeness matrix
+    completeness_matrix = []
+
+    for athlete in selected_athletes:
+        athlete_data = df[df['ATHLETE_NAME'] == athlete]
+        row = {'Athlete': athlete}
+
+        for metric in all_metrics:
+            metric_data = athlete_data[athlete_data['TARGET_VARIABLE'] == metric]
+            if len(metric_data) > 0:
+                valid_count = metric_data['RESULT'].notna().sum()
+                row[metric] = valid_count
+            else:
+                row[metric] = 0
+
+        completeness_matrix.append(row)
+
+    completeness_df = pd.DataFrame(completeness_matrix)
+    completeness_df = completeness_df.set_index('Athlete')
+
+    # Create heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=completeness_df.values,
+        x=[m[:30] for m in completeness_df.columns],
+        y=completeness_df.index,
+        colorscale='Viridis',
+        colorbar=dict(title="Data Points"),
+        hovertemplate='<b>%{y}</b><br>%{x}<br>Data Points: %{z}<extra></extra>'
+    ))
+
+    fig.update_layout(
+        title="Data Completeness Matrix (Athletes × Metrics)",
+        xaxis_title="Metrics",
+        yaxis_title="Athletes",
+        height=400 + len(selected_athletes) * 15,
+        xaxis={'tickangle': 45}
+    )
+
+    # Calculate quality scores
+    quality_scores = []
+    for athlete in selected_athletes:
+        athlete_data = df[df['ATHLETE_NAME'] == athlete]
+
+        total_possible = len(all_metrics)
+        metrics_with_data = athlete_data['TARGET_VARIABLE'].nunique()
+        avg_data_points = len(athlete_data) / max(metrics_with_data, 1)
+
+        quality_score = (metrics_with_data / total_possible) * 100
+
+        quality_scores.append({
+            'Athlete': athlete,
+            'Metrics Coverage (%)': round(quality_score, 1),
+            'Metrics with Data': metrics_with_data,
+            'Avg Data Points/Metric': round(avg_data_points, 1),
+            'Total Data Points': len(athlete_data)
+        })
+
+    quality_df = pd.DataFrame(quality_scores).sort_values('Metrics Coverage (%)', ascending=False)
+
+    return fig, quality_df, completeness_df
+
+def generate_cluster_insights(pca_results, cluster_labels, athlete_names):
+    """Automatically generate cluster interpretations"""
+    cluster_insights = {}
+
+    # Get the original data (scaled)
+    scaled_data = pca_results.get('athlete_metrics', None)
+    if scaled_data is None:
+        return cluster_insights
+
+    for cluster_id in np.unique(cluster_labels):
+        cluster_mask = cluster_labels == cluster_id
+        cluster_athletes = [athlete_names[i] for i, mask in enumerate(cluster_mask) if mask]
+
+        # Get cluster centroid
+        cluster_data = scaled_data.iloc[cluster_mask]
+        cluster_mean = cluster_data.mean()
+        overall_mean = scaled_data.mean()
+        overall_std = scaled_data.std()
+
+        # Calculate z-scores
+        z_scores = (cluster_mean - overall_mean) / (overall_std + 1e-8)
+
+        # Identify top strengths (high positive z-scores)
+        top_strengths = z_scores.nlargest(3)
+        top_weaknesses = z_scores.nsmallest(3)
+
+        # Generate descriptive name
+        strength_names = []
+        for metric in top_strengths.index[:2]:
+            if 'POWER' in metric.upper():
+                strength_names.append('Power')
+            elif 'FORCE' in metric.upper():
+                strength_names.append('Force')
+            elif 'VELOCITY' in metric.upper() or 'SPEED' in metric.upper():
+                strength_names.append('Speed')
+            elif 'JUMP' in metric.upper() or 'HEIGHT' in metric.upper():
+                strength_names.append('Jump')
+            elif 'RFD' in metric.upper():
+                strength_names.append('RFD')
+            else:
+                strength_names.append(metric.split()[0])
+
+        # Remove duplicates
+        strength_names = list(dict.fromkeys(strength_names))
+
+        if strength_names:
+            cluster_name = f"High {'/'.join(strength_names[:2])}"
+        else:
+            cluster_name = f"Cluster {cluster_id + 1}"
+
+        cluster_insights[cluster_id] = {
+            'name': cluster_name,
+            'athletes': cluster_athletes,
+            'size': len(cluster_athletes),
+            'top_strengths': [(metric, float(z_scores[metric])) for metric in top_strengths.index],
+            'top_weaknesses': [(metric, float(z_scores[metric])) for metric in top_weaknesses.index],
+            'avg_performance': float(z_scores.mean())
+        }
+
+    return cluster_insights
+
+def create_athlete_profile_card(df, athlete_name, selected_athletes):
+    """Generate individual athlete profile with strengths/weaknesses"""
+    athlete_data = df[df['ATHLETE_NAME'] == athlete_name]
+
+    # Calculate athlete metrics
+    athlete_metrics = athlete_data.groupby('TARGET_VARIABLE')['RESULT'].mean()
+
+    # Calculate group averages for comparison
+    group_data = df[df['ATHLETE_NAME'].isin(selected_athletes)]
+    group_metrics = group_data.groupby('TARGET_VARIABLE')['RESULT'].agg(['mean', 'std'])
+
+    # Calculate z-scores
+    profile = []
+    for metric in athlete_metrics.index:
+        if metric in group_metrics.index:
+            athlete_val = athlete_metrics[metric]
+            group_mean = group_metrics.loc[metric, 'mean']
+            group_std = group_metrics.loc[metric, 'std']
+
+            if group_std > 0:
+                z_score = (athlete_val - group_mean) / group_std
+            else:
+                z_score = 0
+
+            profile.append({
+                'Metric': metric,
+                'Value': round(athlete_val, 2),
+                'Group Avg': round(group_mean, 2),
+                'Z-Score': round(z_score, 2),
+                'Percentile': round(stats.norm.cdf(z_score) * 100, 1)
+            })
+
+    profile_df = pd.DataFrame(profile).sort_values('Z-Score', ascending=False)
+
+    # Identify strengths and weaknesses
+    strengths = profile_df.head(5)
+    weaknesses = profile_df.tail(5)
+
+    return profile_df, strengths, weaknesses
+
+def compare_athletes(df, athlete1, athlete2, selected_metrics):
+    """Head-to-head athlete comparison"""
+    comparison_data = []
+
+    for metric in selected_metrics:
+        a1_data = df[(df['ATHLETE_NAME'] == athlete1) & (df['TARGET_VARIABLE'] == metric)]
+        a2_data = df[(df['ATHLETE_NAME'] == athlete2) & (df['TARGET_VARIABLE'] == metric)]
+
+        if len(a1_data) > 0 and len(a2_data) > 0:
+            a1_val = a1_data['RESULT'].mean()
+            a2_val = a2_data['RESULT'].mean()
+
+            diff = a1_val - a2_val
+            diff_pct = (diff / abs(a2_val)) * 100 if a2_val != 0 else 0
+
+            comparison_data.append({
+                'Metric': metric,
+                athlete1: round(a1_val, 2),
+                athlete2: round(a2_val, 2),
+                'Difference': round(diff, 2),
+                'Difference (%)': round(diff_pct, 1),
+                'Winner': athlete1 if diff > 0 else athlete2
+            })
+
+    comparison_df = pd.DataFrame(comparison_data)
+
+    # Create radar chart
+    if len(comparison_df) > 0:
+        # Normalize values for radar chart
+        metrics = comparison_df['Metric'].head(10).tolist()
+        a1_vals = comparison_df[athlete1].head(10).tolist()
+        a2_vals = comparison_df[athlete2].head(10).tolist()
+
+        # FIXED: Per-metric normalization (original used global min-max which distorts radar)
+        a1_norm = []
+        a2_norm = []
+        for v1, v2 in zip(a1_vals, a2_vals):
+            local_min = min(v1, v2)
+            local_max = max(v1, v2)
+            if local_max > local_min:
+                a1_norm.append(20 + ((v1 - local_min) / (local_max - local_min)) * 80)
+                a2_norm.append(20 + ((v2 - local_min) / (local_max - local_min)) * 80)
+            else:
+                a1_norm.append(60)
+                a2_norm.append(60)
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatterpolar(
+            r=a1_norm + [a1_norm[0]],
+            theta=metrics + [metrics[0]],
+            fill='toself',
+            name=athlete1,
+            line=dict(color='blue')
+        ))
+
+        fig.add_trace(go.Scatterpolar(
+            r=a2_norm + [a2_norm[0]],
+            theta=metrics + [metrics[0]],
+            fill='toself',
+            name=athlete2,
+            line=dict(color='red')
+        ))
+
+        fig.update_layout(
+            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+            showlegend=True,
+            title=f"{athlete1} vs {athlete2} - Performance Comparison"
+        )
+
+        return comparison_df, fig
+
+    return comparison_df, None
+
+def export_pca_results(pca_results, cluster_labels, athlete_names):
+    """Export PCA results to downloadable format"""
+    export_data = []
+
+    pca_data = pca_results['pca_data']
+
+    for i, athlete in enumerate(athlete_names):
+        row = {
+            'Athlete': athlete,
+            'Cluster': int(cluster_labels[i]) + 1,
+            'PC1': round(pca_data[i, 0], 4),
+            'PC2': round(pca_data[i, 1], 4) if pca_data.shape[1] > 1 else 0,
+            'PC3': round(pca_data[i, 2], 4) if pca_data.shape[1] > 2 else 0
+        }
+        export_data.append(row)
+
+    export_df = pd.DataFrame(export_data)
+    return export_df
 
 # ==========================================
 # MAIN APPLICATION
@@ -1007,13 +1542,75 @@ def main():
     
     # Main content area
     if uploaded_file is not None and df is not None and len(selected_athletes) >= 2:
-        
+
         # Create tabs for different analyses
-        tab1, tab2, tab3, tab4 = st.tabs(["📈 Metrics Analysis", "🎯 PCA & Clustering", "📊 Performance Trends", "📋 Summary Report"])
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "📊 Data Quality",
+            "📈 Metrics Analysis",
+            "🎯 PCA & Clustering",
+            "📊 Performance Trends",
+            "👤 Athlete Profiles",
+            "📋 Summary Report"
+        ])
         
         with tab1:
+            st.header("Data Quality Dashboard")
+            st.markdown("Understand your data completeness and quality before analysis")
+
+            with st.spinner("Analyzing data quality..."):
+                metrics_df, all_available_metrics, metric_categories = analyze_metrics(df_jump)
+
+                # Limit metrics for visualization to prevent overwhelming display
+                top_metrics_for_viz = all_available_metrics[:30]
+
+                quality_fig, quality_df, completeness_matrix = create_data_quality_dashboard(
+                    df_jump, selected_athletes, top_metrics_for_viz
+                )
+
+            # Display quality scores
+            st.subheader("📊 Athlete Data Quality Scores")
+            st.markdown("Higher scores indicate more complete data coverage across metrics")
+
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                st.dataframe(quality_df, use_container_width=True, hide_index=True)
+
+            with col2:
+                st.metric("Average Coverage", f"{quality_df['Metrics Coverage (%)'].mean():.1f}%")
+                st.metric("Best Coverage", f"{quality_df['Metrics Coverage (%)'].max():.1f}%")
+                st.metric("Lowest Coverage", f"{quality_df['Metrics Coverage (%)'].min():.1f}%")
+
+            # Display completeness heatmap
+            st.subheader("🗺️ Data Completeness Heatmap")
+            st.markdown(f"Showing top {len(top_metrics_for_viz)} metrics")
+            st.plotly_chart(quality_fig, use_container_width=True)
+
+            # Missing data insights
+            st.subheader("💡 Data Insights")
+
+            total_possible = len(selected_athletes) * len(all_available_metrics)
+            total_actual = sum(quality_df['Total Data Points'])
+            overall_completeness = (total_actual / (len(selected_athletes) * len(all_available_metrics))) * 100
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Overall Completeness", f"{overall_completeness:.1f}%")
+            with col2:
+                st.metric("Total Metrics Available", len(all_available_metrics))
+            with col3:
+                st.metric("Total Data Points", total_actual)
+
+            # Recommendations
+            low_coverage_athletes = quality_df[quality_df['Metrics Coverage (%)'] < 50]
+            if len(low_coverage_athletes) > 0:
+                st.warning(f"⚠️ {len(low_coverage_athletes)} athletes have less than 50% metric coverage. Consider collecting more data for: {', '.join(low_coverage_athletes['Athlete'].tolist()[:3])}")
+            else:
+                st.success("✅ All athletes have good data coverage!")
+
+        with tab2:
             st.header("Metrics Analysis")
-            
+
             with st.spinner("Analyzing metrics..."):
                 metrics_df, all_available_metrics, metric_categories = analyze_metrics(df_jump)
             
@@ -1044,26 +1641,73 @@ def main():
                 top_metrics['Completeness %'] = top_metrics['Completeness %'].round(1)
                 st.dataframe(top_metrics, hide_index=True)
             
-            st.subheader("🔍 Available Metrics for Analysis")
-            st.info(f"Total of {len(all_available_metrics)} metrics available across all categories")
+            st.subheader("🔍 Metric Search & Filter")
+
+            # Search and quick filter
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                search_term = st.text_input(
+                    "🔎 Search metrics",
+                    placeholder="Type to search... (e.g., 'power', 'force', 'velocity')",
+                    key="metric_search"
+                )
+
+            with col2:
+                quick_filter = st.selectbox(
+                    "Quick Filter",
+                    options=["All", "Power & Force", "Speed & Velocity", "Jump Performance", "Timing", "RFD", "Asymmetry"],
+                    key="quick_filter"
+                )
+
+            # Apply search and filter
+            filtered_metrics = search_and_filter_metrics(all_available_metrics, search_term, quick_filter)
+
+            st.info(f"Showing {len(filtered_metrics)} of {len(all_available_metrics)} total metrics")
+
+            # Display filtered metrics
+            if filtered_metrics:
+                with st.expander(f"📊 View {len(filtered_metrics)} filtered metrics"):
+                    # Group into columns for better display
+                    num_cols = 3
+                    cols = st.columns(num_cols)
+
+                    for idx, metric in enumerate(filtered_metrics[:30]):  # Show first 30
+                        col_idx = idx % num_cols
+                        with cols[col_idx]:
+                            st.write(f"• {metric[:45]}")
+
+                    if len(filtered_metrics) > 30:
+                        st.write(f"... and {len(filtered_metrics) - 30} more")
+            else:
+                st.warning("No metrics match your search criteria")
 
             # Show breakdown by category
-            with st.expander("View metrics by category"):
+            st.markdown("---")
+            st.subheader("📂 Metrics by Category")
+            with st.expander("View all metrics organized by category"):
                 for category, metrics in metric_categories.items():
                     if metrics:  # Only show non-empty categories
                         st.markdown(f"**{category.title()}**: {len(metrics)} metrics")
+                        for m in metrics[:5]:
+                            st.write(f"  • {m}")
+                        if len(metrics) > 5:
+                            st.write(f"  • ... and {len(metrics) - 5} more")
         
-        with tab2:
+        with tab3:
             st.header("PCA Analysis & Clustering")
-           
-            
+
+            # Get metrics first
+            with st.spinner("Analyzing metrics..."):
+                metrics_df, all_available_metrics, metric_categories = analyze_metrics(df_jump)
+
             # ==========================================
             # SECTION 1: OVERALL PCA WITH ALL METRICS
             # ==========================================
-            
+
             st.subheader("🎯 Overall PCA Analysis - All Available Metrics")
             st.markdown(f"*Using all {len(all_available_metrics)} available metrics from {selected_jump}*")
-            
+
             if len(all_available_metrics) >= 3:
                 # Add cluster selection control
                 col1, col2 = st.columns([1, 2])
@@ -1076,28 +1720,93 @@ def main():
                         help="Choose how many groups to create",
                         key="overall_clusters"
                     )
-                
+
                 with st.spinner("Performing Overall PCA analysis with all metrics..."):
                     pca_results_overall = perform_pca_analysis(df_jump, all_available_metrics, selected_athletes)
-                    fig_pca_overall, clusters_overall = create_visualizations(pca_results_overall, num_clusters_overall)
+                    fig_pca_overall, clusters_overall, sil_score_overall = create_visualizations(pca_results_overall, num_clusters_overall)
+
+                # === NEW: PCA Diagnostics Panel ===
+                st.subheader("🔬 PCA Diagnostics")
+                diag = pca_results_overall.get('diagnostics', {})
+                dcol1, dcol2, dcol3, dcol4 = st.columns(4)
+                with dcol1:
+                    kmo = diag.get('kmo')
+                    kmo_label = "N/A" if kmo is None else f"{kmo:.3f}"
+                    kmo_quality = "" if kmo is None else (" ✅" if kmo > 0.7 else " ⚠️" if kmo > 0.5 else " ❌")
+                    st.metric("KMO Score", kmo_label + kmo_quality)
+                with dcol2:
+                    bp = diag.get('bartlett_p')
+                    bp_label = "N/A" if bp is None else (f"p < 0.001 ✅" if bp < 0.001 else f"p = {bp:.4f}")
+                    st.metric("Bartlett's Test", bp_label)
+                with dcol3:
+                    st.metric("Kaiser Components", pca_results_overall.get('n_kaiser', 'N/A'))
+                with dcol4:
+                    st.metric("Parallel Analysis", pca_results_overall.get('n_parallel', 'N/A'))
                 
+                if sil_score_overall is not None:
+                    qual = "Poor" if sil_score_overall < 0.25 else "Fair" if sil_score_overall < 0.5 else "Good" if sil_score_overall < 0.75 else "Excellent"
+                    st.info(f"**Silhouette Score:** {sil_score_overall:.3f} ({qual}) — measures how well-separated the clusters are")
+                
+                # NEW: Correlation heatmap
+                with st.expander("🔥 Correlation Matrix (verify PCA suitability)"):
+                    st.markdown("*PCA works by exploiting correlations. Blocks of red/blue = correlated metrics that PCA can compress.*")
+                    corr_fig, _ = create_correlation_heatmap(pca_results_overall['athlete_metrics'])
+                    st.plotly_chart(corr_fig, use_container_width=True)
+                
+                # NEW: Biplot
+                with st.expander("🎯 PCA Biplot (Athletes + Metric Arrows)"):
+                    st.markdown("*Arrows show which metrics drive each PC direction. Arrow angle = correlation between metrics.*")
+                    biplot_fig = create_biplot(
+                        pca_results_overall['pca_model'],
+                        pca_results_overall['pca_data'],
+                        pca_results_overall['feature_names'],
+                        list(pca_results_overall['athlete_metrics'].index),
+                        cluster_labels=clusters_overall
+                    )
+                    st.plotly_chart(biplot_fig, use_container_width=True)
+
                 st.plotly_chart(fig_pca_overall, use_container_width=True)
-                
-                # Show cluster assignments
-                st.subheader("🎯 Cluster Assignments (Overall Analysis)")
-                cluster_df_overall = pd.DataFrame({
-                    'Athlete': list(pca_results_overall['athlete_metrics'].index),
-                    'Cluster': [f"Group {c + 1}" for c in clusters_overall]
-                })
-                
-                # Create columns for cluster groups
-                cols = st.columns(min(num_clusters_overall, 3))
-                for i in range(num_clusters_overall):
-                    with cols[i % 3]:
-                        st.markdown(f"**Group {i + 1}**")
-                        group_athletes = cluster_df_overall[cluster_df_overall['Cluster'] == f"Group {i + 1}"]['Athlete'].tolist()
-                        for athlete in group_athletes:
-                            st.write(f"• {athlete}")
+
+                # Generate and display cluster insights
+                st.subheader("🎯 Cluster Insights (Overall Analysis)")
+                athlete_names_overall = list(pca_results_overall['athlete_metrics'].index)
+                cluster_insights_overall = generate_cluster_insights(
+                    pca_results_overall, clusters_overall, athlete_names_overall
+                )
+
+                # Display insights for each cluster
+                for cluster_id, insights in cluster_insights_overall.items():
+                    with st.expander(f"📊 {insights['name']} - {insights['size']} athletes"):
+                        st.markdown(f"**Athletes:** {', '.join(insights['athletes'])}")
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("**💪 Key Strengths:**")
+                            for metric, z_score in insights['top_strengths'][:3]:
+                                st.write(f"• {metric[:35]}: +{z_score:.1f}σ")
+
+                        with col2:
+                            st.markdown("**📈 Development Areas:**")
+                            for metric, z_score in insights['top_weaknesses'][:3]:
+                                st.write(f"• {metric[:35]}: {z_score:.1f}σ")
+
+                # Export functionality
+                st.markdown("---")
+                st.subheader("📥 Export PCA Results")
+
+                export_df_overall = export_pca_results(pca_results_overall, clusters_overall, athlete_names_overall)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv_export = export_df_overall.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Overall PCA Results (CSV)",
+                        data=csv_export,
+                        file_name=f"pca_overall_{selected_jump}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+
             else:
                 st.warning("⚠️ Not enough metrics available for Overall PCA analysis")
 
@@ -1242,6 +1951,12 @@ def main():
                             actual_clusters = pca_result['n_clusters']
                             
                             st.info(f"Using {len(valid_metrics)} metrics with {len(athlete_names)} athletes")
+                            
+                            # Show silhouette score if available
+                            sil = pca_result.get('silhouette_score')
+                            if sil is not None:
+                                qual = "Poor" if sil < 0.25 else "Fair" if sil < 0.5 else "Good" if sil < 0.75 else "Excellent"
+                                st.success(f"**Cluster Silhouette Score:** {sil:.3f} ({qual})")
                             
                             # Create visualizations
                             colors = px.colors.qualitative.Set1
@@ -1419,9 +2134,13 @@ def main():
                 """)
 
 
-        with tab3:
+        with tab4:
             st.header("Performance Trends Over Time")
-            
+
+            # Get metrics first
+            with st.spinner("Analyzing metrics..."):
+                metrics_df, all_available_metrics, metric_categories = analyze_metrics(df_jump)
+
             st.subheader("Select Metrics to Track")
             
             # Use the metric categories from Tab 1
@@ -1505,8 +2224,23 @@ def main():
                                 if improvement < 0:
                                     st.write(f"• {athlete}: {improvement}%")
                         
-                        # Detailed improvement table
+                        # Detailed improvement table with significance
                         st.subheader("📊 Detailed Improvement Analysis")
+
+                        # Show significance legend
+                        st.markdown("**Statistical Significance:** *** p<0.001, ** p<0.01, * p<0.05, ns = not significant")
+                        st.markdown("**Effect Size (Cohen's d):** 0.2 = small, 0.5 = medium, 0.8 = large, 1.2+ = very large")
+
+                        # Display table with significance and effect size
+                        display_cols = ['Athlete', 'Metric', 'Improvement (%)', 'Significance', 'Data Points']
+                        if 'Effect Size (d)' in improvement_df.columns:
+                            display_cols.insert(4, 'Effect Size (d)')
+                        st.dataframe(
+                            improvement_df[display_cols].head(20),
+                            use_container_width=True,
+                            hide_index=True
+                        )
+
                         improvement_pivot = improvement_df.pivot_table(
                             index='Athlete',
                             columns='Metric',
@@ -1538,8 +2272,143 @@ def main():
                     st.warning("⚠️ Please select at least one metric to analyze trends")
             else:
                 st.info("👆 Please select at least one category to see available metrics")
-        
-        with tab4:
+
+        with tab5:
+            st.header("👤 Athlete Profiles & Comparisons")
+
+            # Get metrics first
+            with st.spinner("Analyzing metrics..."):
+                metrics_df, all_available_metrics, metric_categories = analyze_metrics(df_jump)
+
+            st.markdown("View individual athlete profiles and compare athletes head-to-head")
+
+            # Section 1: Individual Athlete Profiles
+            st.subheader("🎯 Individual Athlete Profile")
+
+            selected_athlete_profile = st.selectbox(
+                "Select athlete to view profile",
+                options=selected_athletes,
+                key="profile_athlete"
+            )
+
+            if selected_athlete_profile:
+                with st.spinner(f"Generating profile for {selected_athlete_profile}..."):
+                    profile_df, strengths, weaknesses = create_athlete_profile_card(
+                        df_jump, selected_athlete_profile, selected_athletes
+                    )
+
+                # Display profile summary
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.metric("Total Metrics", len(profile_df))
+
+                with col2:
+                    avg_percentile = profile_df['Percentile'].mean()
+                    st.metric("Avg Percentile", f"{avg_percentile:.1f}%")
+
+                with col3:
+                    above_avg = len(profile_df[profile_df['Z-Score'] > 0])
+                    st.metric("Above Average Metrics", f"{above_avg}/{len(profile_df)}")
+
+                # Strengths and Weaknesses
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("### 💪 Top 5 Strengths")
+                    for _, row in strengths.iterrows():
+                        st.markdown(f"**{row['Metric'][:40]}**")
+                        st.write(f"Value: {row['Value']:.2f} | Group Avg: {row['Group Avg']:.2f}")
+                        st.write(f"Percentile: {row['Percentile']:.0f}% | Z-Score: +{row['Z-Score']:.2f}σ")
+                        st.markdown("---")
+
+                with col2:
+                    st.markdown("### 📈 Top 5 Development Areas")
+                    for _, row in weaknesses.iterrows():
+                        st.markdown(f"**{row['Metric'][:40]}**")
+                        st.write(f"Value: {row['Value']:.2f} | Group Avg: {row['Group Avg']:.2f}")
+                        st.write(f"Percentile: {row['Percentile']:.0f}% | Z-Score: {row['Z-Score']:.2f}σ")
+                        st.markdown("---")
+
+                # Full profile table
+                with st.expander("📊 View Full Profile"):
+                    st.dataframe(
+                        profile_df[['Metric', 'Value', 'Group Avg', 'Z-Score', 'Percentile']],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+            # Section 2: Head-to-Head Comparison
+            st.markdown("---")
+            st.subheader("⚔️ Head-to-Head Athlete Comparison")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                athlete1 = st.selectbox(
+                    "Select first athlete",
+                    options=selected_athletes,
+                    key="compare_athlete1"
+                )
+
+            with col2:
+                athlete2_options = [a for a in selected_athletes if a != athlete1]
+                athlete2 = st.selectbox(
+                    "Select second athlete",
+                    options=athlete2_options,
+                    key="compare_athlete2"
+                )
+
+            if athlete1 and athlete2:
+                # Category selection for comparison
+                comparison_categories = st.multiselect(
+                    "Select categories for comparison",
+                    options=list(metric_categories.keys()),
+                    default=list(metric_categories.keys())[:3] if len(metric_categories) >= 3 else list(metric_categories.keys()),
+                    key="comparison_categories"
+                )
+
+                if comparison_categories:
+                    # Get metrics from selected categories
+                    comparison_metrics = []
+                    for cat in comparison_categories:
+                        comparison_metrics.extend(metric_categories[cat])
+
+                    comparison_metrics = list(dict.fromkeys(comparison_metrics))[:15]  # Limit to 15 metrics
+
+                    with st.spinner("Comparing athletes..."):
+                        comparison_df, radar_fig = compare_athletes(df_jump, athlete1, athlete2, comparison_metrics)
+
+                    if radar_fig:
+                        st.plotly_chart(radar_fig, use_container_width=True)
+
+                    if not comparison_df.empty:
+                        # Summary stats
+                        col1, col2, col3 = st.columns(3)
+
+                        with col1:
+                            athlete1_wins = len(comparison_df[comparison_df['Winner'] == athlete1])
+                            st.metric(f"{athlete1} Leads", athlete1_wins)
+
+                        with col2:
+                            athlete2_wins = len(comparison_df[comparison_df['Winner'] == athlete2])
+                            st.metric(f"{athlete2} Leads", athlete2_wins)
+
+                        with col3:
+                            avg_diff = comparison_df['Difference (%)'].abs().mean()
+                            st.metric("Avg Difference", f"{avg_diff:.1f}%")
+
+                        # Detailed comparison table
+                        st.subheader("📊 Detailed Comparison")
+                        st.dataframe(
+                            comparison_df[['Metric', athlete1, athlete2, 'Difference', 'Difference (%)', 'Winner']],
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                else:
+                    st.info("👆 Select at least one category for comparison")
+
+        with tab6:
             st.header("Summary Report")
             
             # Generate summary statistics
@@ -1578,19 +2447,46 @@ def main():
         
         st.markdown("""
         ### How to use this application:
-        
+
         1. **Upload your data**: Use the sidebar to upload your force plate CSV file
         2. **Select jump type**: Choose which type of jump to analyze
-        3. **Choose athletes**: Select athletes for comparison (2-15 recommended)
-        4. **Explore results**: Navigate through the tabs to see different analyses
-        
+        3. **Choose athletes**: Select athletes for comparison (2-20 recommended)
+        4. **Explore results**: Navigate through the six analysis tabs
+
         ### What this app does:
-        
-        - **Metrics Analysis**: Identifies and categorizes performance metrics
-        - **PCA & Clustering**: Groups similar athletes based on performance patterns
-        - **Enhanced PCA**: Category-based analysis for targeted insights
-        - **Performance Trends**: Tracks improvements over time
-        - **Summary Report**: Provides overview and export functionality
+
+        #### 📊 Tab 1: Data Quality Dashboard
+        - View data completeness heatmaps
+        - Identify athletes with missing data
+        - Get quality scores and recommendations
+
+        #### 📈 Tab 2: Metrics Analysis
+        - Search and filter through 100+ metrics
+        - Quick filters for Power, Force, Speed, etc.
+        - Categorized metric organization
+
+        #### 🎯 Tab 3: PCA & Clustering
+        - Overall PCA with ALL metrics
+        - Category-specific PCA (e.g., only Power metrics)
+        - Automatic cluster naming and insights
+        - Export PCA results to CSV
+        - 2D and 3D visualizations
+
+        #### 📊 Tab 4: Performance Trends
+        - Track metrics over time
+        - Statistical significance testing (p-values)
+        - Improvement heatmaps
+        - Identify top improvers
+
+        #### 👤 Tab 5: Athlete Profiles
+        - Individual athlete strength/weakness analysis
+        - Percentile rankings vs group
+        - Head-to-head comparisons with radar charts
+        - Win/loss tracking between athletes
+
+        #### 📋 Tab 6: Summary Report
+        - Export all analysis results
+        - Overall statistics and insights
         
         ### Data Requirements:
         
